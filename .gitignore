@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# TensorRT engines. Built by trtexec on this board and NOT portable: an engine is
+# tied to the GPU architecture, the TensorRT version and the driver it was built
+# against, and a mismatch either refuses to load or, worse, loads and misbehaves.
+# Anyone cloning this rebuilds from the .onnx for their own machine.
+*.engine
+*.plan
+*.trt
+
+# ONNX exports. Intermediate artifacts on the way from .pt to .engine, and large
+# (the detector is 82 MB). Regenerate with ultralytics' export rather than storing.
+*.onnx
+
+# Trained weights. These are the only artifacts here that cannot be regenerated
+# from anything else in the repo, so do not just delete them -- but 44 MB of
+# binary does not belong in git history either. Publish them as release assets or
+# track them with Git LFS, and note in the README where a clone should get them.
+*.pt
+
+# Build and run logs
+*.log
+
+# Colour matrix refitted for local lighting; the default lives in receiver.py
+ccm.json
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

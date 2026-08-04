@@ -73,21 +73,125 @@ Roughly 10 ms of slack, which is why the cardinal count is capped rather than
 unbounded. If you need more headroom, an INT8 detector engine takes 54 ms down to
 roughly 31 ms — see `../yolo-test/RESULTS.md`.
 
+Adding the full-resolution branch and per-detection bearing/range estimation costs
+essentially nothing measurable: **13.2–13.9 fps/camera, `dropped=0`, `stale_full=0`**.
+The extra branch is a VIC pass and the geometry is a handful of Newton iterations per
+box.
+
 ## Geometry, and why it is a crop rather than a letterbox
 
 The sensor gives 2592×1944 (4:3). The detector wants 1280×640 (2:1). Letterboxing
-would spend a third of the network input on grey bars; stretching would distort.
-So the sender crops a **2592×1296** band and scales it by exactly **2.025× in both
-axes** — full sensor width, no padding, no distortion. Box coordinates therefore
-map to the preview with one uniform scale, which is what makes the overlay simple
-and exact.
+would spend a third of the network input on grey bars; stretching would distort. So
+the sender **crops** a 2:1 band — no padding, no distortion — and box coordinates
+map to the preview with one uniform scale, which is what makes the overlay exact.
 
-`--crop-top` chooses which horizontal band (default centred). On a boat you want
-the band containing the horizon.
+The band is **2048×1024 scaled by 1.6×** by default, and *not* the full sensor
+width. Full width was the original choice, but the calibration says the left and
+right edges of a 2592-wide crop fall outside the lens's valid cone (88° off axis),
+where a pixel has no bearing at all. Giving those up buys 27 % more pixels per buoy
+as well.
 
-Because the full-resolution frame is what the camera captured, you can crop the
-original at detection coordinates for a true high-resolution look at any object:
-multiply box coordinates by 2.025 and add `crop_top` to the y values.
+`--aim-deg` swings the window toward the pair's **overlap**, which was measured
+rather than assumed — the same ceiling lamp sits at cam0 x≈2045 and cam1 x≈280, so
+the cameras diverge with the overlap on cam0's right and cam1's left. The default
+`15` applies +15° to cam0 and −15° to cam1:
+
+```
+cam0: crop 2048x1024 at (544,460), aim +15.0 deg, covers 139.3x69.4 deg, 1.200 mrad/px
+cam1: crop 2048x1024 at (119,460), aim -15.0 deg, covers 139.2x69.4 deg, 1.201 mrad/px
+```
+
+The aim is clamped to what the crop width allows (a 2048-wide window cannot swing
+much past 15°) and the *achieved* value is printed, so a request that could not be
+honoured is visible rather than silent. `--crop-w` sets the width; `--crop-top`
+picks the band, and on a boat you want the one containing the horizon.
+
+The full-resolution frame is kept as its own pipeline branch, so any detection can
+be measured at native resolution: multiply box coordinates by `crop_w / net_w` and
+add the crop origin. The header carries `crop`, `full_w` and `full_h` for exactly
+this.
+
+## Bearing, range and capture time
+
+With a calibration present (`--calib`, on by default), every detection gains a
+bearing, a range and an uncertainty for each — see [estimate.py](estimate.py) and
+the field list in [protocol.py](protocol.py). `--no-estimate` turns it all off,
+including the full-resolution branch that feeds it.
+
+**Capture time.** The header's `t_capture` comes from the GStreamer buffer PTS, not
+from `time.time()` after inference. That matters more than it sounds: measured over
+40 frames, capture→send latency was **min 174, median 247, max 471 ms**. The old
+timestamp was a quarter-second late *and varied by 300 ms*, so it was not a constant
+you could have subtracted out. `t_sent` and `latency_ms` are on the wire separately
+so pipeline delay stays visible instead of contaminating the measurement.
+
+This is also a rolling shutter with a **64 ms top-to-bottom sweep**, so a frame does
+not have a single capture instant. Each detection carries its own `t_row`; use that
+for anything geometric.
+
+**Bearing** is reported as azimuth/elevation and as a unit vector `ray_cam`, in the
+**camera** frame. Relating the two cameras to each other or to the boat needs the
+mount rotation, which is not in this repo. σ is ~0.26°, and it is split on the wire
+because the parts behave differently: `sigma_calib_deg` (0.25°) is the calibration's
+own error and is **correlated** — the same on every detection, every frame, so it
+does not average out over a track and does not cancel between the cameras. Only
+`sigma_centroid_deg` (~0.03–0.07°) is independent noise that averages down.
+
+**Range** comes from apparent size, assuming a sphere of `--buoy-diameter` (0.40 m
+for Njord marks): `z = (D/2)/sin(α/2)`, the exact tangent geometry. It measures
+**width, not height**, because these marks float and the waterline cuts an unknown
+amount off the bottom. Error grows as z²:
+
+| Range | Buoy width | σ | |
+| --- | --- | --- | --- |
+| 10 m | 33 px | ±0.5 m (5 %) | good |
+| 20 m | 17 px | ±1.3 m (7 %) | good |
+| 30 m | 11 px | ±2.4 m (8 %) | good |
+| 50 m | 6.7 px | ±5.9 m (12 %) | marginal |
+| 100 m | 3.3 px | ±22 m (22 %) | check `valid` first |
+
+Validated by planting synthetic buoys of known range into real frames. Subpixel edge
+refinement engages down to ~15 full-resolution px (≈25 m) and falls back to the
+detector box beyond that, with σ widening honestly — a 35 m buoy read 28 ± 9.8 m,
+truth inside the bar. **Weight by `sigma_m` and check `valid`**; do not trust
+`range_m` merely because a number came back.
+
+Beyond ~30 m, apparent size is the wrong cue. Depression below the horizon is far
+better — a buoy at 100 m with a 2 m camera height sits 20 mrad ≈ 16 px below the
+horizon, giving ~6 % instead of 22 % — but it needs camera height and attitude.
+`../camera-test/horizon/` has the horizon detection for it.
+
+## Calibration
+
+[calibrate/](calibrate/) fits a Kannala-Brandt fisheye model per camera. The results
+live in `calibrate/calib/cam0.json` and `cam1.json` and are what the sender loads;
+the stills they were fitted from are gitignored, being hundreds of MB specific to
+one lens at one focus position.
+
+```bash
+./.venv/bin/python calibrate/calib_server.py          # then browse to :8080, space to shoot
+./.venv/bin/python calibrate/calibrate_fisheye.py --help
+```
+
+Both cameras came out at **RMS ~1.18 px** over 123/160 views, an implied HFOV of
+168.1°/166.7°, and an expected bearing error of **~0.25°**, unbiased. That number is
+a split-half disagreement halved (each half-fit sees half the data), and it is
+*systematic*, not noise-limited — doubling the data did not shrink the parameter
+spread. The likely floor is LCD cover-glass parallax at oblique angles, since the
+target was a laptop screen; a matte printed target is the change that could reach
+~0.1°.
+
+Two things about this model are worth knowing before touching the code:
+
+* **`cv2.fisheye` cannot represent field angles ≥ 90°.** It computes
+  θ = atan(‖(X/Z, Y/Z)‖), so past the wall it silently *folds back* — 110° lands at
+  the same radius as 70°. Verified empirically on this build, and it is why the
+  fitter computes a **valid cone** (here 88°) and returns NaN outside it rather than
+  a plausible wrong answer. `in_valid_cone` on the wire is the same idea.
+* **Scale of a planar target is a gauge freedom for the intrinsics** — it moves
+  `tvecs` only, not K or D. *Non-uniform* scale is not, and permanently corrupts the
+  fx/fy ratio, which is why the target's aspect must be right even when its absolute
+  size does not matter.
 
 ## Sensor modes
 
@@ -117,10 +221,19 @@ Detections look like:
 ```json
 {"id": 7, "cls": 2, "name": "cardinal", "conf": 0.77,
  "box": [400.0, 250.0, 470.0, 340.0],
- "card": "north", "card_conf": 0.88}
+ "card": "north", "card_conf": 0.88,
+ "bearing_deg": 12.44, "elevation_deg": -1.87, "field_angle_deg": 27.6,
+ "ray_cam": [0.2154, -0.0326, 0.9760], "in_valid_cone": true,
+ "sigma_deg": 0.259, "sigma_calib_deg": 0.25, "sigma_centroid_deg": 0.068,
+ "mrad_per_px": 1.204,
+ "range": {"range_m": 21.7, "sigma_m": 1.5, "rel_sigma": 0.069,
+           "alpha_mrad": 18.4, "valid": true, "why": null},
+ "width_method": "refined_edges", "edge_sigma_px": 1.0, "width_px_full": 15.3,
+ "truncated": false, "t_capture": 1785876440.230088, "t_row": 1785876440.264}
 ```
 
-`card` is null except on cardinal detections that were classified.
+`card` is null except on cardinal detections that were classified. The geometry
+fields are null without a calibration or outside the valid cone.
 
 `/api/status` on the viewer returns the current detections as JSON, which is the
 hook to use if you want to consume them from something other than the browser.
@@ -213,5 +326,18 @@ on and is worth an experiment rather than an assumption.
   `Internal data stream error` — both cameras, not just the branch.
 * **No NVENC on Orin Nano.** There is no hardware H.264/H.265 encoder on this
   module, which is why the preview is MJPEG.
+* **`src-crop` must happen exactly once.** `nvvideoconvert` writes its crop
+  rectangle into the shared `NvBufSurface` metadata, and a `tee` hands every branch
+  the *same* surface — so two croppers off one tee race, and it segfaults with
+  *"Failed in mem copy"* (`nvbufsurftransform_copy.cpp:438`) and a core dump. Each
+  branch works perfectly in isolation, which is what makes it a trap. Hence the
+  two-level tee in `build_pipeline`.
+* **Match branches by PTS, never by "newest".** The full-resolution branch has no
+  inference in it, so it runs a frame ahead of the detector; taking the newest sample
+  measured buoys against the wrong frame 99 % of the time (`stale_full=944/954`).
+  Both the JPEG and the full-res caches are PTS-keyed for this reason, and
+  `stale_full=` in the stats line is there to prove it stays at 0.
+* **`--crop-w 2592` is not a valid option** even though the sensor is that wide: the
+  edges fall outside the calibration's 88° cone, so detections there have no bearing.
 * **Recovering a wedged camera stack:** power-cycle. Restarting `nvargus-daemon`
   and reloading `nv_ov5647` were both tried and neither works.

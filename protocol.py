@@ -14,12 +14,64 @@ instead of giving up.
 Header fields:
     cam          int    0 or 1
     seq          int    monotonic per camera
-    ts           float  sender's time.time() when the frame was captured
+    ts           float  == t_capture; kept under the old name for compatibility
+    t_capture    float  epoch seconds when the frame's FIRST ROW was exposed,
+                        derived from the GStreamer buffer PTS. Not when inference
+                        ran and not when the message was built -- those are
+                        t_sent and latency_ms, kept separate so pipeline delay
+                        stays visible instead of contaminating the measurement.
+    t_sent       float  time.time() after inference, for latency bookkeeping only
+    latency_ms   float  t_sent - t_capture
+    readout_ms   float  rolling-shutter sweep top-to-bottom (~64 ms at mode 0).
+                        Each detection carries its own t_row within this window;
+                        a frame does NOT have one capture instant.
     net_w/net_h  int    detector input size the boxes are expressed in
     jpeg_w/jpeg_h int   preview size, so the receiver can scale boxes to it
+    crop         list   [left, top, w, h] of the sensor window the detector saw
+    full_w/full_h int   full sensor size, the frame `crop` is measured in
+    refined      bool   whether the full-resolution frame was available, i.e.
+                        whether width_method could be "refined_edges"
     jpeg_bytes   int    payload length
     fps          float  sender's measured rate, for display
-    dets         list   [{id, cls, name, conf, box:[x1,y1,x2,y2], card, card_conf}]
+    dets         list   see below
+
+Each detection carries, beyond {id, cls, name, conf, box, card, card_conf}:
+
+    bearing_deg       azimuth right of the optical axis, CAMERA frame
+    elevation_deg     positive up, CAMERA frame
+    field_angle_deg   angle off the optical axis; how far into the fisheye it is
+    ray_cam           unit vector [x,y,z], +x right +y down +z forward. This is
+                      what a triangulator wants; the two angles are for humans.
+    in_valid_cone     false => bearing is null, the pixel is past the calibrated
+                      88 deg limit and no bearing exists there
+    sigma_deg         total bearing uncertainty, and split into:
+    sigma_calib_deg     the calibration's own error, ~0.25 deg. CORRELATED across
+                        every detection and every frame from this camera -- it does
+                        not average out over a track and does not cancel between
+                        the two cameras.
+    sigma_centroid_deg  independent per detection; this part does average down.
+    mrad_per_px       local angular scale, which varies ~2x across the frame
+
+    range: {range_m, sigma_m, rel_sigma, alpha_mrad, alpha_sigma_mrad,
+            valid, why}
+                      Range from apparent size, assuming a sphere of
+                      --buoy-diameter (0.40 m for Njord marks):
+                      z = (D/2)/sin(alpha/2). Accuracy degrades as z^2 --
+                      roughly 6 % at 20 m, 12 % at 50 m, 22 % at 100 m -- so
+                      ALWAYS check `valid` and weight by sigma_m rather than
+                      trusting range_m because a number came back.
+    width_method      "refined_edges" (subpixel edges measured on the full-res Y
+                      plane) or "detector_box" (fallback; several times worse)
+    edge_sigma_px     the per-edge uncertainty that fed sigma_m
+    width_px_full     measured silhouette width in full sensor pixels
+    truncated         box touches the crop edge, so the width is a lower bound
+                      and range is forced invalid
+    t_capture/t_row   frame time, and the time this detection's own sensor rows
+                      were exposed. Use t_row for anything geometric.
+
+Range uses the buoy's WIDTH, not its height: these marks float, so the waterline
+cuts an unknown amount off the bottom while the horizontal extent through the
+centre is the full diameter.
 
 `id` is a track id that persists while the sender keeps seeing the same buoy, so
 consecutive frames can be related to each other. It is unique per camera, not

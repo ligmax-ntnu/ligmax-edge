@@ -30,6 +30,17 @@ venv/
 # Colour matrix refitted for local lighting; the default lives in receiver.py
 ccm.json
 
+# Calibration stills and the artefacts derived from them: hundreds of MB of
+# full-resolution PNG, specific to one physical camera at one lens position --
+# refocus a lens and they are worthless. Excluded by EXTENSION rather than by
+# directory on purpose: the fitted cam*.json models are small, are the actual
+# product, and belong in git, and git will not descend into an excluded directory
+# to honour a later !negation.
+calibrate/**/*.png
+calibrate/**/*.jpg
+calibrate/**/*.jpeg
+calibrate/**/*.bmp
+
 # Editors / OS
 .vscode/
 .idea/
@@ -37,3 +48,7 @@ ccm.json
 *~
 .DS_Store
 Thumbs.db
+
+# Preview/inspection renders written by calibrate_fisheye.py --check and the
+# capture server. Entirely derived; regenerate rather than track.
+calibrate/preview/

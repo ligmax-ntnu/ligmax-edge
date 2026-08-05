@@ -22,7 +22,8 @@ NAME = "ligmax-edge"
 START = ["./run.sh"]
 DASH = os.environ.get("LIGMAX_DEPLOY_URL", "https://live.ligmax.no").rstrip("/")
 KEY = os.environ.get("LIGMAX_NODE_KEY", "")
-POLL = 30
+POLL = 30  # seconds between /pending checks
+TICK = 1  # how often we look at the child, so a restart is not a poll behind
 
 
 def say(msg):
@@ -46,28 +47,45 @@ def head():
     ).stdout.strip()
 
 
+def wait_for_work(child):
+    """Block until the child exits or the dashboard asks for a pull.
+
+    Returns the nonce of a request, or None if the child exited on its own.
+    """
+    next_poll = time.time() + POLL
+    while child.poll() is None:
+        time.sleep(TICK)
+        if time.time() < next_poll:
+            continue
+        next_poll = time.time() + POLL
+        try:
+            pending = ask("/pending")
+            if pending.get("requested"):
+                return pending.get("nonce")
+        except Exception:
+            pass  # dashboard unreachable is normal in the field; keep running
+    return None
+
+
 while True:
     # start_new_session so we signal run.sh AND the sender.py it spawns
     child = subprocess.Popen(START, cwd=REPO, start_new_session=True)
     say(f"started {START[0]} as pid {child.pid} at {head()[:8]}")
 
-    nonce = None
-    while child.poll() is None:
-        time.sleep(POLL)
-        try:
-            pending = ask("/pending")
-            if pending.get("requested"):
-                nonce = pending.get("nonce")
-                break
-        except Exception:
-            pass  # dashboard unreachable is normal in the field; keep running
+    nonce = wait_for_work(child)
 
-    if child.poll() is None:
-        os.killpg(os.getpgid(child.pid), signal.SIGTERM)
-        try:
-            child.wait(15)
-        except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(child.pid), signal.SIGKILL)
+    # Keyed off the request, not off whether the child is still up. Gating the
+    # pull on `child.poll() is None` meant a run.sh that had died during the poll
+    # interval swallowed the request entirely: nothing was pulled, nothing was
+    # reported, and the operator's row sat at "Waiting" for 30 minutes. The
+    # cameras latching into an Argus error makes that exit the normal case here.
+    if nonce is not None:
+        if child.poll() is None:
+            os.killpg(os.getpgid(child.pid), signal.SIGTERM)
+            try:
+                child.wait(15)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(child.pid), signal.SIGKILL)
 
         before = head()
         pull = subprocess.run(

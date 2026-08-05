@@ -1,0 +1,44 @@
+# Runs update.py, which runs run.sh and pulls when the dashboard asks.
+#
+# Install (edit the two paths and the user first):
+#   sudo cp ligmax-edge.service /etc/systemd/system/
+#   sudo mkdir -p /etc/ligmax
+#   sudo tee /etc/ligmax/node.env >/dev/null <<'EOF'
+#   LIGMAX_DEPLOY_URL=https://live.ligmax.no
+#   LIGMAX_NODE_KEY=<LIGMAX_NODE_KEY from ligmax-server/.env>
+#   HOST=192.168.99.135
+#   PORT=3338
+#   EOF
+#   sudo chmod 640 /etc/ligmax/node.env
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ligmax-edge
+#
+# `enable` is the word that matters: it is what makes this come back after a power
+# cycle. `start` alone lasts until the next reboot. Check it took:
+#   systemctl is-enabled ligmax-edge      -> enabled
+#   journalctl -u ligmax-edge -f
+
+[Unit]
+Description=Ligmax edge perception (run.sh) + updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ligmax
+WorkingDirectory=/home/ligmax/ligmax-edge
+# HOST and PORT are read by run.sh and decide where the video stream is sent.
+EnvironmentFile=/etc/ligmax/node.env
+ExecStart=/usr/bin/python3 update.py
+
+# The cameras can come up before the CSI stack is ready after a cold boot, and
+# run.sh exits rather than serving an empty feed. update.py retries it every 5 s;
+# this line covers the supervisor itself dying.
+Restart=always
+RestartSec=10
+
+# The Jetson needs the video devices.
+SupplementaryGroups=video
+
+[Install]
+WantedBy=multi-user.target

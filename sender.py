@@ -1,8 +1,24 @@
 #!/usr/bin/env python3
-"""Dual OV5647 -> YOLO26 detector -> cardinal classifier -> TCP to the viewer.
+"""Dual OV5647 -> YOLO26 detector -> cardinal classifier -> TCP to the Pi.
 
 Runs on the Jetson. For each camera it emits a small preview JPEG plus the
 detections, and the receiver draws the boxes.
+
+Two destinations, on purpose
+----------------------------
+  detections + preview  --TCP :3401--> ligmax-pi3.local
+      The Pi fuses these with the aft lidar and sends ONE world model up the
+      telemetry link, so the operator's map cannot show two disagreeing versions
+      of the same buoy. `receiver.py` also still accepts this stream directly,
+      which is what you point at during bench work.
+
+  preview JPEG          --HTTPS-----> live.ligmax.no /api/camera
+      Straight to shore, small and off by default, so the dashboard can show a
+      picture without one existing on the 4G uplink at all times. See
+      `cloud_camera.py`; `--no-cloud` disables it outright.
+
+Note the port: :3401, not :3338. The dashboard binds 3338 and `live.ligmax.no` is
+forwarded there, so the edge feed moved off it (docs/findings.md item 1).
 
 Geometry, which is the fiddly part:
   sensor mode 0 gives 2592x1944 (4:3, full field of view, 14 fps). The detector
@@ -32,9 +48,11 @@ white balance is pinned to daylight rather than left on auto -- see build_pipeli
 for why both are done where they are. Detections carry a persistent id from
 Tracker, since the exported engine has no tracker of its own.
 
-  ./sender.py --host 192.168.99.135 --port 3338
-  ./sender.py --host 192.168.99.135 --preview 640x320 --conf 0.3
-  ./sender.py --host 192.168.99.135 --no-rotate --wb auto --no-track
+  ./sender.py                                       # -> ligmax-pi3.local:3401
+  ./sender.py --host 192.168.99.135 --port 3401     # -> a viewer, for bench work
+  ./sender.py --no-cloud                            # no dashboard uplink at all
+  ./sender.py --preview 640x320 --conf 0.3
+  ./sender.py --no-rotate --wb auto --no-track
 """
 import argparse
 import json
@@ -50,6 +68,8 @@ import gi
 import numpy as np
 from PIL import Image
 from scipy.optimize import linear_sum_assignment
+
+from cloud_camera import CameraUplink
 
 gi.require_version("Gst", "1.0")
 # GstApp must be imported for appsink's try_pull_sample/pull_sample to exist as
@@ -407,10 +427,39 @@ class Tracker:
         return ids
 
 
+def _cloud_line(cloud):
+    """One compact field for the stats line: is video going to shore, and how much.
+
+    Deliberately says `off` rather than nothing when the operator has not asked for
+    video, so the log distinguishes "nobody wants it" from "it is broken".
+    """
+    stats = cloud.stats()
+    if not stats["enabled"]:
+        return "off"
+    parts = [f"{stats['sent']}sent"]
+    if stats["dropped"]:
+        parts.append(f"{stats['dropped']}drop")
+    if stats["errors"]:
+        parts.append(f"{stats['errors']}err")
+    parts.append(stats["asked"])
+    return "/".join(parts)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="192.168.99.135")
-    ap.add_argument("--port", type=int, default=3338)
+    # The Pi, which fuses these detections with the aft lidar before anything
+    # reaches shore. Port 3401 rather than 3338: the dashboard owns 3338 and
+    # live.ligmax.no is forwarded to it (docs/findings.md item 1).
+    ap.add_argument("--host", default=os.environ.get("LIGMAX_FUSION_HOST",
+                                                     "ligmax-pi3.local"))
+    ap.add_argument("--port", type=int,
+                    default=int(os.environ.get("LIGMAX_FUSION_PORT", "3401")))
+    # The dashboard uplink. On by default only in the sense that it *connects*:
+    # the server says video is off until an operator asks, so nothing is sent.
+    ap.add_argument("--no-cloud", action="store_true",
+                    help="do not offer preview frames to the dashboard at all")
+    ap.add_argument("--cloud-url", default=None,
+                    help="dashboard root; default LIGMAX_UPLOAD_URL or live.ligmax.no")
     ap.add_argument("--mode", type=int, default=0, choices=sorted(SENSOR),
                     help="sensor mode: 0=2592x1944@14 (default, full FOV), "
                          "1=1920x1080@29, 2=1296x972@28. Modes 3 and 4 do not "
@@ -555,6 +604,17 @@ def main():
 
     tx = Sender(args.host, args.port)
     tx.start()
+
+    # The dashboard uplink. Constructed even when video is off, because it is what
+    # polls to find out whether an operator has switched it on - and because
+    # starting it later would mean restarting the detector, which means tearing
+    # down capture, which Argus does not forgive.
+    cloud = None
+    if not args.no_cloud:
+        cloud = (CameraUplink(args.cloud_url, os.environ.get("LIGMAX_BOAT_KEY"))
+                 if args.cloud_url else CameraUplink.from_env())
+        print(f"dashboard uplink -> {cloud.scheme}://{cloud.host}:{cloud.port}"
+              f" (off until an operator asks for it)")
 
     if pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
         print("failed to start pipeline", file=sys.stderr)
@@ -732,6 +792,13 @@ def main():
                     "dets": items,
                 }, jpeg)
 
+                # Offer the same preview to the dashboard. It rate-limits and
+                # re-encodes on its own thread, and returns immediately when video
+                # is off, so this costs nothing in the common case. The picture
+                # goes straight to shore; the detections above go to the Pi.
+                if cloud is not None:
+                    cloud.submit(i, jpeg, pw, ph, t_cap)
+
             el = time.monotonic() - t_stats
             if el >= args.stats_every:
                 fps_meas = frames / el
@@ -740,7 +807,9 @@ def main():
                       f"cardinals={cards} "
                       f"stale_full={y_stale[0]}/{y_stale[1]} "
                       f"est_err={est_err[0]} "
-                      f"link={'up' if tx.connected else 'DOWN'}", flush=True)
+                      f"link={'up' if tx.connected else 'DOWN'}"
+                      + (f"  cloud={_cloud_line(cloud)}" if cloud else ""),
+                      flush=True)
                 frames, cards = 0, 0
                 t_stats = time.monotonic()
     except KeyboardInterrupt:
@@ -753,6 +822,8 @@ def main():
         pipe.set_state(Gst.State.NULL)
         pipe.get_state(3 * Gst.SECOND)
         tx.shutdown()
+        if cloud is not None:
+            cloud.close()
         det.close()
         if cls is not None:
             cls.close()

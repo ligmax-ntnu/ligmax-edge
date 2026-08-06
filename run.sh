@@ -1,16 +1,32 @@
 #!/usr/bin/env bash
-# Start the detector and stream to the viewer.
+# Start the detector and stream detections to the Pi, which fuses them.
 #
 # Checks the cameras actually deliver a frame first: on this board the capture
 # stack can sit in a latched Argus error state where every mode enumerates fine
 # and streams nothing, and only a power cycle clears it. Better to say so up front
 # than to hand back an empty feed.
+#
+# Two destinations, and they are not the same:
+#   HOST:PORT              detections + preview, TCP, to ligmax-pi3.local. The Pi
+#                          merges them with the aft lidar and sends one world model
+#                          to the dashboard. Point this at a laptop running
+#                          receiver.py instead when you are bench testing.
+#   the dashboard uplink   preview JPEG only, HTTPS, to live.ligmax.no, and only
+#                          when an operator switches video on. cloud_camera.py
+#                          takes its target from LIGMAX_UPLOAD_URL /
+#                          LIGMAX_DEPLOY_URL and its secret from LIGMAX_BOAT_KEY,
+#                          all of which are already in /etc/ligmax/node.env.
+#                          NO_CLOUD=1 disables it.
+#
+# PORT is 3401, not 3338: the dashboard binds 3338 and live.ligmax.no is forwarded
+# there, so this feed moved off it (docs/findings.md item 1).
 set -uo pipefail
 
-HOST=${HOST:-192.168.99.135}
-PORT=${PORT:-3338}
+HOST=${HOST:-ligmax-pi3.local}
+PORT=${PORT:-3401}
 MODE=${MODE:-0}
 PREVIEW=${PREVIEW:-640x320}
+NO_CLOUD=${NO_CLOUD:-0}
 
 cd "$(dirname "$0")"
 
@@ -48,6 +64,12 @@ for id in 0 1; do
 done
 rm -rf "$tmp"
 
+CLOUD_ARG=()
+if [ "$NO_CLOUD" = "1" ]; then
+  CLOUD_ARG=(--no-cloud)
+fi
+
 echo
 exec ./.venv/bin/python sender.py \
-  --host "$HOST" --port "$PORT" --mode "$MODE" --preview "$PREVIEW" "$@"
+  --host "$HOST" --port "$PORT" --mode "$MODE" --preview "$PREVIEW" \
+  "${CLOUD_ARG[@]}" "$@"

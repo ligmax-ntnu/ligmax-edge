@@ -5,6 +5,7 @@ __pycache__/
 venv/
 *.egg-info/
 .pytest_cache/
+.claude/
 
 # TensorRT engines. Built by trtexec on this board and NOT portable: an engine is
 # tied to the GPU architecture, the TensorRT version and the driver it was built

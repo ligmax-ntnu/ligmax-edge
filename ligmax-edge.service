@@ -1,6 +1,11 @@
 # Runs update.py, which runs run.sh and pulls when the dashboard asks.
 #
-# Install (edit the two paths and the user first):
+# Install (copy as-is; User and WorkingDirectory below already match the account
+# the Jetson image ships with, jadmin. They used to say `ligmax`, a user that does
+# not exist on the board: systemd cannot resolve it, so every start died at
+# 217/USER before a line of Python ran, and Restart=always turned that into a
+# 10-second reboot loop. If you do run this under a different account, change both
+# lines together and make sure that account is in the `video` group.):
 #   sudo cp ligmax-edge.service /etc/systemd/system/
 #   sudo mkdir -p /etc/ligmax
 #   sudo tee /etc/ligmax/node.env >/dev/null <<'EOF'
@@ -25,8 +30,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ligmax
-WorkingDirectory=/home/ligmax/ligmax-edge
+User=jadmin
+WorkingDirectory=/home/jadmin/ligmax-edge
 # HOST and PORT are read by run.sh and decide where the video stream is sent.
 EnvironmentFile=/etc/ligmax/node.env
 ExecStart=/usr/bin/python3 update.py

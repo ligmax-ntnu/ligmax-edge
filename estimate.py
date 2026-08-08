@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 
 import cv2
 import numpy as np
@@ -203,16 +204,35 @@ class CaptureClock:
     A buffer's PTS is running time in the pipeline clock: wall = base_time + pts,
     expressed in the clock's own domain. GstSystemClock is CLOCK_MONOTONIC here, so a
     monotonic->epoch offset is also needed. That offset is sampled ONCE and reused:
-    resampling per frame would inject NTP's slew into the frame-to-frame intervals,
-    which is precisely the signal a parallax pipeline is trying to measure. The
-    consequence is that absolute time may drift slowly against UTC while relative
+    resampling every frame would inject NTP's ongoing SLEW into the frame-to-frame
+    intervals, which is precisely the signal a parallax pipeline is trying to measure.
+    The consequence is that absolute time may drift slowly against UTC while relative
     times stay exact -- the right trade for this use.
+
+    Slew is not the only way the offset can move, though. This Jetson has no
+    battery-backed RTC, so at boot the clock holds whatever `fake-hwclock` last wrote,
+    and NTP's *first* correction after the network comes up is a hard STEP -- not a
+    slew -- that can be minutes to hours, not microseconds. If that step lands after
+    this class has already sampled the offset, every `frame_time()` for the rest of
+    the process's life is wrong by exactly the size of that step, and the front
+    lidar's colour goes with it: `skew_ms` (`fusion.fuse`, `max_skew`) is measured
+    against this clock, so a stuck offset makes every point look untimely and every
+    return ships uncoloured. Seen once as 58 minutes of skew -- findings.md item 23.
+
+    `frame_time()` re-baselines when the offset has moved past `STEP_S`, and leaves it
+    alone otherwise. NTP slew is bounded to a few hundred ppm, i.e. a small fraction of
+    a millisecond between calls -- nowhere near this threshold -- so the two cases
+    cannot be confused with each other by anything this class has actually measured.
     """
 
+    # A step this small would already be an unusually bad slew estimate; a step this
+    # large cannot be slew at all -- see the class docstring.
+    STEP_S = 1.0
+
     def __init__(self, base_time_ns: int, fps: float, readout_frac: float = 0.9):
-        import time
         self.base_time_ns = int(base_time_ns)
         self.mono_to_epoch = time.time() - time.monotonic()
+        self.steps = 0
         # Rolling-shutter readout of the active rows. On the OV5647 at 2592x1944 the
         # active lines occupy nearly the whole frame period, so the bottom of the
         # frame is exposed ~60 ms after the top. Approximate, and worth overriding if
@@ -221,6 +241,13 @@ class CaptureClock:
 
     def frame_time(self, pts_ns: int) -> float:
         """Epoch seconds at the START of this frame's readout (top row)."""
+        now = time.time() - time.monotonic()
+        if abs(now - self.mono_to_epoch) > self.STEP_S:
+            print(f"[capture-clock] system clock stepped {now - self.mono_to_epoch:+.1f}s "
+                  f"since the last check -- was the NTP sync just applied? "
+                  f"re-baselining", flush=True)
+            self.mono_to_epoch = now
+            self.steps += 1
         return (self.base_time_ns + int(pts_ns)) / 1e9 + self.mono_to_epoch
 
     def row_time(self, pts_ns: int, y_full: float, height: int) -> float:

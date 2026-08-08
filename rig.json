@@ -38,19 +38,34 @@
 
   "lidar": {
     "_yaw": [
-      "The unit is bolted on rotated about 45 deg to the LEFT (to port), so its own",
-      "0 mark points 45 deg to port of the boat's forward. -45 here turns the scan",
-      "back onto the rig's axes, which is what makes a return dead ahead of the boat",
-      "come out at rig bearing 0 and line up with the cameras.",
-      "Check the sign before trusting it: with this right, an object straight ahead",
-      "reads near 0 deg in the overlay tool and near the top of the receiver's",
-      "top-down plot. If everything sits 90 deg out, the sign is flipped."
+      "STALE since the unit was remounted upside down (2026-08-08) -- see _angle",
+      "below for the half of this that changed with confidence. This -45 was",
+      "measured for the OLD, right-side-up mount: its own 0 mark pointed 45 deg to",
+      "port, and -45 turned that back onto the rig's forward.",
+      "",
+      "A remount changes which physical direction the 0 mark points, and by how",
+      "much depends on WHICH horizontal axis it was flipped about -- rolled over",
+      "(0 mark mirrors port<->starboard, new yaw is the simple sign flip, +45) is a",
+      "different answer from pitched over (0 mark mirrors fore<->aft, new yaw is",
+      "nowhere near +45). Guessing between them would be exactly the invented",
+      "hardware number this repo's docs say not to publish, so this is left at the",
+      "OLD, now-wrong value rather than a fabricated new one -- do not trust the",
+      "front lidar's bearing (or its colouring, which projects through this same",
+      "geometry) until it is remeasured.",
+      "",
+      "One measurement fixes it: put a target dead ahead, read its RAW reported_deg",
+      "in test_lidar_overlay.py (angle_zero_deg is 0, so that reading needs no",
+      "correction itself), and with angle_dir now -1 below,",
+      "    yaw_deg = reported_deg_dead_ahead",
+      "makes rig bearing 0 for that target. Check the sign before trusting it, same",
+      "as always: dead ahead should read near 0 deg in the overlay tool and near",
+      "the top of the receiver's top-down plot."
     ],
     "yaw_deg": -45.0,
     "pitch_deg": 0.0,
     "roll_deg": 0.0,
     "xyz_m": [0.0, 0.0, 0.0],
-    "angle_dir": 1,
+    "angle_dir": -1,
     "angle_zero_deg": 0.0,
     "_angle": [
       "How the C1's reported heading becomes a direction in the rig frame:",
@@ -59,9 +74,17 @@
       "so a = 0 is forward (+z) and a grows toward starboard (+x).",
       "angle_dir is +1 for the C1's clockwise-from-above convention and -1 if your",
       "unit or mounting runs the other way; angle_zero_deg rotates the sensor's own",
-      "0 mark onto the rig's forward. VERIFY BOTH with the overlay tool rather than",
-      "trusting them -- a sign error here looks like a plausible but mirrored world,",
-      "which is the failure most likely to survive a casual glance."
+      "0 mark onto the rig's forward.",
+      "",
+      "Flipped to -1 on 2026-08-08: the unit was remounted upside down, and turning",
+      "a rotationally-symmetric sensor over reverses the rotation's apparent",
+      "chirality as seen from the rig's fixed 'above' (-y) reference, regardless of",
+      "which horizontal axis the flip was about -- unlike the yaw fix above, this",
+      "one direction argument holds no matter how it was physically flipped.",
+      "VERIFY ANYWAY with the overlay tool rather than trusting it -- nothing here",
+      "has been run against hardware since the remount, and a sign error on this",
+      "specific flag looks like a plausible but mirrored world, which is the",
+      "failure most likely to survive a casual glance."
     ]
   },
 

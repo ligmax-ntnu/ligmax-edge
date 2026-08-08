@@ -48,7 +48,20 @@ def ask(path, body=None):
     req = urllib.request.Request(
         f"{DASH}/api/deploy/{NAME}{path}",
         data=json.dumps(body).encode() if body else None,
-        headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {KEY}",
+            "Content-Type": "application/json",
+            # Cloudflare fronts live.ligmax.no and bans urllib's default
+            # "Python-urllib/3.x" signature outright: every poll came back 403
+            # with Cloudflare error 1010, so the node sat at "Never polled" on
+            # the dashboard while this process had been running the whole time.
+            # That is the same symptom the _next_poll starvation above causes,
+            # and it had a second, independent cause -- fixing the timer alone
+            # does not help when the request never reaches the app. Any
+            # non-default agent is accepted; cloud_camera.py sets one too,
+            # which is why the video uplink was never affected.
+            "User-Agent": UA,
+        },
     )
     with urllib.request.urlopen(req, timeout=10) as response:
         return json.load(response)
@@ -65,16 +78,25 @@ def poll_if_due():
 
     Timer is module-global on purpose -- see the comment on `_next_poll`.
     """
-    global _next_poll
+    global _next_poll, poll_fails
     if time.time() < _next_poll:
         return None
     _next_poll = time.time() + POLL
     try:
         pending = ask("/pending")
+        if poll_fails:
+            say(f"dashboard reachable again after {poll_fails} failed polls")
+            poll_fails = 0
         if pending.get("requested"):
             return pending.get("nonce")
-    except Exception:
-        pass  # dashboard unreachable is normal in the field; keep running
+    except Exception as exc:
+        # An unreachable dashboard IS normal in the field, so this must not fill
+        # the journal - but swallowing it in silence is exactly how a 403 on
+        # every single poll went unnoticed until someone happened to read the
+        # dashboard. Say it the first time, then hourly.
+        if poll_fails % QUIET == 0:
+            say(f"poll failed ({poll_fails + 1} in a row): {type(exc).__name__}: {exc}")
+        poll_fails += 1
     return None
 
 

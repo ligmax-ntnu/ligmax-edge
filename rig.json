@@ -20,11 +20,26 @@
     "    pitch about +x (right)    positive is NOSE UP",
     "    roll  about +z (forward)  positive puts STARBOARD DOWN",
     "",
-    "DEFAULTS. Cameras about horizontal, 15 deg either side of forward (30 deg",
-    "between them), each about 5 cm from the lidar centre along its own pointing",
-    "direction and about 5 cm above the scan plane -- the height is what stops the",
-    "camera body blocking the lidar. cam0 and cam1 are written out in full rather",
-    "than mirrored so each can absorb its own mounting error independently.",
+    "CAMERAS. BACK TO BACK, not both looking forward. Each faces its own beam and",
+    "is turned 15 deg toward the bow, so their axes are 180-15-15 = 150 deg apart",
+    "and their fields meet across the bow instead of overlapping almost entirely.",
+    "cam0 looks to PORT (yaw -75), cam1 to STARBOARD (yaw +75). Each sits about",
+    "5 cm from the lidar centre along its own pointing direction and about 5 cm",
+    "above the scan plane -- the height is what stops the camera body blocking the",
+    "lidar. cam0 and cam1 are written out in full rather than mirrored so each can",
+    "absorb its own mounting error independently.",
+    "",
+    "This file said 15 deg either side of FORWARD until 2026-08-08, which put both",
+    "cameras 90 deg from where they actually are and had them the wrong way round.",
+    "Nothing failed: the fit was fine, every projection landed inside a frame, and",
+    "the sweep came out fully coloured -- from the wrong lens. cam1 is the physical",
+    "STARBOARD camera, confirmed by shining a green light into it and finding the",
+    "colour on the PORT half of the plot, which is exactly what a pose 150 deg out",
+    "does. The 150 deg figure is the mounting as described by hand; the two yaws",
+    "below are that figure split evenly about the beam, so VERIFY THEM with",
+    "test/test_lidar_overlay.py --cam 0 --yaw N before trusting a bearing. The",
+    "cameras do not overlap enough to register against each other (measured: no",
+    "correlation peak), so the lidar is the only thing that can tie them together.",
     "",
     "The cameras are inverted and the pipeline rotates 180 deg before anything else",
     "sees the frame, so the calibration, the images and these poses are all in the",
@@ -88,17 +103,27 @@
     ]
   },
 
+  "_cams": [
+    "xyz is 5 cm along each camera's own pointing direction, per the rule above:",
+    "0.05 * (sin(yaw), 0, cos(yaw)) with y = -0.05 for the height over the scan",
+    "plane. It moved with the yaw because it is derived from it, not measured",
+    "separately. At 2-12 m a 5 cm baseline is worth under 1.5 deg anyway -- the",
+    "yaw is what decides whether colour lands on the right return, not this."
+  ],
+
   "cam0": {
-    "yaw_deg": 15.0,
+    "_note": "PORT-facing. Was +15.0 (assumed forward-looking); see the header.",
+    "yaw_deg": -75.0,
     "pitch_deg": 0.0,
     "roll_deg": 0.0,
-    "xyz_m": [0.012941, -0.05, 0.048296]
+    "xyz_m": [-0.048296, -0.05, 0.012941]
   },
 
   "cam1": {
-    "yaw_deg": -15.0,
+    "_note": "STARBOARD-facing. Was -15.0 (assumed forward-looking); see header.",
+    "yaw_deg": 75.0,
     "pitch_deg": 0.0,
     "roll_deg": 0.0,
-    "xyz_m": [-0.012941, -0.05, 0.048296]
+    "xyz_m": [0.048296, -0.05, 0.012941]
   }
 }

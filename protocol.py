@@ -37,6 +37,13 @@ Header fields (KIND_FRAME):
     full_w/full_h int   full sensor size, the frame `crop` is measured in
     refined      bool   whether the full-resolution frame was available, i.e.
                         whether width_method could be "refined_edges"
+    saturation   float  chroma gain Argus's ISP already applied, 0-2. Default 2.0,
+                        because JetPack ships no ISP tuning for the OV5647 and its
+                        untouched output is ~1/3 the chroma of a normal camera.
+                        A viewer that colour-corrects MUST read this and apply only
+                        the remainder (fusion.ccm_strength_for): a full matrix on
+                        top of a boosted frame clips about half of it. Absent on
+                        senders older than this field -- treat that as 1.0.
     jpeg_bytes   int    payload length
     fps          float  sender's measured rate, for display
     dets         list   see below
@@ -138,11 +145,13 @@ the repeated keys would be most of the bytes:
                         on a moving boat, exactly as t_row is used per detection.
     q                   the C1's own return-strength figure
     cam                 0, 1, or -1 for a point no camera could see or colour
-    rgb                 FLAT r,g,b,r,g,b... so it is 3*n long, not n. Sensor-native
-                        values straight off the detector frame: the OV5647 colour
-                        matrix runs at the receiver, so these are not calibrated
-                        colours, they are the same numbers the boxes were drawn
-                        from. (0,0,0) where cam is -1.
+    rgb                 FLAT r,g,b,r,g,b... so it is 3*n long, not n. Sampled off
+                        the detector frame -- the same pixels the boxes were drawn
+                        from -- and COLOUR-CORRECTED before sending (the OV5647
+                        matrix, `fusion._correct`). Display them as they arrive:
+                        they are comparable to a corrected preview, and a consumer
+                        that boosts saturation to compensate for raw sensor values
+                        is now correcting twice. (0,0,0) where cam is -1.
     det                 track id of the detection this return belongs to, or -1.
                         Only foreground returns are tagged, so the sea visible
                         through a box is not attributed to the buoy.

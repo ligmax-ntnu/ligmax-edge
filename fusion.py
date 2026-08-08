@@ -29,9 +29,11 @@ they disagree.
 
 The colour goes the other way. A 2D scanner returns a range and nothing else, so
 a wall, a buoy and a person are the same measurement; the camera is what says
-which. Colour is sensor-native RGB straight off the detector frame -- the OV5647
-colour-correction matrix runs at the *receiver* (README), so do not read these as
-calibrated colours, only as the same values the boxes were drawn from.
+which. Colour is sampled off the detector frame -- the same pixels the boxes were
+drawn from -- and then run through the OV5647 correction matrix HERE (`_correct`),
+so what goes on the wire is comparable to the corrected preview a viewer shows.
+The README puts that pass at the receiver, and for a 819k-pixel frame it belongs
+there; a 400-point sweep is 2000x smaller and the argument does not carry.
 
 Time, which is the part that is easy to get wrong
 -------------------------------------------------
@@ -76,6 +78,20 @@ FOREGROUND_GATE_M = 0.5
 # distant buoy, where a wide one would average the target with the sea behind it.
 PATCH_X = 2            # +-2 px horizontally -> 5 wide
 PATCH_DY = (0, 3)      # 0..+3 px DOWN from the projected pixel -> 4 tall
+
+# JetPack ships no ISP colour tuning for the OV5647, so Argus hands back close to
+# sensor-native RGB: every Bayer sensor has heavy spectral crosstalk between its
+# filters, and measured against SMPTE 75% bars these primaries come out at
+# 0.30-0.41 saturation instead of 1.00 -- which is why reds arrive brown. This is
+# the matrix that undoes it, fitted in ../camera-test (see ov5647_color.py there).
+# Rows sum to ~1, so neutrals stay neutral and brightness is preserved.
+#
+# receiver.py imports this rather than keeping its own copy: one sensor, one
+# matrix, and a frame and a point sampled from that frame must not be corrected
+# differently or the plot disagrees with the picture it was sampled from.
+OV5647_CCM = np.array(((1.714, -0.538, -0.177),
+                       (-0.097, 1.646, -0.549),
+                       (-0.113, -0.911, 2.024)), dtype=np.float32)
 
 
 def _rot(yaw_deg, pitch_deg, roll_deg):
@@ -192,8 +208,69 @@ def _sample(rgb, u, v):
     return np.rint(rgb[vv, uu].mean(axis=(1, 2))).astype(np.uint8)
 
 
+# Saturation gain the full matrix delivers, measured over 1.6M pixels of real
+# frames off this rig: mean chroma 30.1 raw -> 68.4 corrected. Used to work out
+# how much matrix is left to apply once the ISP has already done some of the job.
+CCM_CHROMA_GAIN = 2.27
+
+# What the two together should add up to. Deliberately ABOVE CCM_CHROMA_GAIN --
+# a little hot is the requested error direction, and undersaturated is the
+# failure that actually costs you, since a detector trained on normal cameras
+# reads a washed-out mark as the wrong class.
+TARGET_CHROMA_GAIN = 2.7
+
+
+def ccm_strength_for(saturation):
+    """How much of the matrix to apply, given what the ISP already did.
+
+    `nvarguscamerasrc saturation` scales chroma inside the ISP and the matrix
+    scales it again, so applying both at full strength is a double correction:
+    measured at saturation 2.0 it clips 53% of the frame, and clipped chroma is
+    information destroyed before the detector or the plot can use it.
+
+    Returns 1.0 at saturation 1.0, so a rig that leaves the ISP alone keeps
+    exactly the behaviour it had. Clamped to [0, 1]: the matrix is a correction,
+    not a gain stage, and running it past full strength distorts hue rather than
+    adding saturation.
+    """
+    s = max(0.05, float(saturation))
+    k = (TARGET_CHROMA_GAIN / s - 1.0) / (CCM_CHROMA_GAIN - 1.0)
+    return float(min(1.0, max(0.0, k)))
+
+
+def _correct(rgb, strength=1.0):
+    """Sensor-native RGB -> colour-corrected RGB, for an (N,3) uint8 array.
+
+    The README puts this pass at the receiver because a 1280x640 FRAME is
+    819k pixels and the Jetson has no budget for it. A sweep is ~400 points --
+    2000x less, measured at 0.06 ms -- so the argument does not carry here, and
+    doing it at the source is what makes the number on the wire mean one thing:
+    every consumer (the Pi, the dashboard, receiver.py) got a raw value it had
+    to guess at otherwise, and the dashboard was left boosting saturation by eye
+    to compensate.
+
+    The matrix is defined in LINEAR light, so the values are linearised first
+    and re-encoded after -- applied straight to gamma-encoded numbers it shifts
+    hues instead of just restoring saturation. Uncoloured points are (0,0,0) and
+    stay there: the rows sum to ~1, so black maps to black.
+    """
+    if strength <= 0.0:
+        return rgb          # identity still costs a lossy round-trip
+    m = OV5647_CCM
+    if strength < 1.0:
+        # Blend back toward identity. The off-diagonal terms are large because
+        # the crosstalk is, so a partial matrix is also less chroma noise.
+        m = np.eye(3, dtype=np.float32) * (1.0 - strength) + m * strength
+    c = rgb.astype(np.float32) / 255.0
+    lin = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+    out = np.clip(lin @ m.T, 0.0, 1.0)
+    srgb = np.where(out <= 0.0031308, out * 12.92,
+                    1.055 * np.power(out, 1.0 / 2.4) - 0.055)
+    return np.rint(srgb * 255.0).astype(np.uint8)
+
+
 def fuse(sweep, rig, views, max_skew=0.06, t_caps=None,
-         foreground_gate=FOREGROUND_GATE_M, build_cloud=True):
+         foreground_gate=FOREGROUND_GATE_M, build_cloud=True, ccm_strength=1.0):
     """Colour a sweep and hang a lidar range off every detection it lands in.
 
     `views` may hold None for a camera that has no calibration or no frame this
@@ -366,6 +443,9 @@ def fuse(sweep, rig, views, max_skew=0.06, t_caps=None,
         "dt_ms": np.round(1000.0 * (t_pt - sweep.t_start), 1).tolist(),
         "q": sweep.quality.tolist(),
         "cam": cam_of.tolist(),
-        "rgb": rgb_of.reshape(-1).tolist(),   # flat r,g,b,r,g,b,...
+        # Colour-corrected here rather than left sensor-native: see `_correct`.
+        # `ccm_strength` is what the ISP's own saturation has NOT already done --
+        # `ccm_strength_for`, which the caller works out from its saturation.
+        "rgb": _correct(rgb_of, ccm_strength).reshape(-1).tolist(),
         "det": det_of.tolist(),
     }

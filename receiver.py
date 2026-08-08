@@ -36,25 +36,22 @@ from PIL import Image, ImageDraw
 
 try:
     import numpy as np
+    # One sensor, one matrix. fusion.py owns it because that is where sensor
+    # pixels are sampled; a frame and a lidar point taken from that same frame
+    # must not be corrected differently, or the top-down plot disagrees with the
+    # picture it was sampled from. fusion imports numpy, so a box without numpy
+    # fails this import too and lands in the same no-correction path as before.
+    from fusion import OV5647_CCM as CCM, ccm_strength_for
 except ImportError:
     np = None
+    CCM = None
+    ccm_strength_for = None
 
 import protocol
 
 # Colours per detector class, plus a fallback.
 COLOURS = {0: (60, 220, 90), 1: (240, 70, 70), 2: (250, 200, 40)}
 FALLBACK = (200, 200, 200)
-
-# JetPack ships no ISP colour tuning for the OV5647, so Argus returns close to
-# sensor-native RGB: every Bayer sensor has heavy spectral crosstalk between its
-# filters, and measured against SMPTE 75% bars these primaries come out at
-# 0.30-0.41 saturation instead of 1.00 -- which is why reds arrive brown. This is
-# the matrix that undoes it, fitted in ../camera-test (see ov5647_color.py there,
-# which also holds the calibration tooling to refit it for your own lighting).
-# Rows sum to ~1, so neutrals stay neutral and brightness is preserved.
-CCM = ((1.714, -0.538, -0.177),
-       (-0.097, 1.646, -0.549),
-       (-0.113, -0.911, 2.024))
 
 _TABLES = {}
 
@@ -171,7 +168,16 @@ def render(jpeg, header, draw, ccm):
 
     Returns the frame untouched if there is nothing to do, or if it will not
     decode -- a corrupt frame should cost an overlay, not the stream.
+
+    `ccm` of None means AUTO, which is the default and the one to use: the sender
+    boosts chroma in the ISP before the frame ever leaves the Jetson and puts the
+    amount in the header, so the strength that belongs here is only whatever that
+    did not already do. Pinning --ccm 1.0 against an ISP-boosted frame corrects
+    twice and clips 53% of it.
     """
+    if ccm is None:
+        ccm = (ccm_strength_for(header.get("saturation", 1.0))
+               if ccm_strength_for is not None else 0.0)
     if not draw and ccm <= 0.0:
         return jpeg
     try:
@@ -199,6 +205,11 @@ def render_lidar(sweep, size=520, max_range=12.0):
 
     Rig frame: +x starboard, +z forward, so the plot is +z up and +x right, which
     is the view from above with the bow at the top.
+
+    The point colours arrive ALREADY corrected -- `fusion._correct` runs the
+    OV5647 matrix over the sweep on the Jetson, where it costs 0.06 ms for ~400
+    points. Do not put `apply_ccm` over them again: correcting twice past-boosts
+    saturation and pushes anything already near the gamut edge out of it.
     """
     im = Image.new("RGB", (size, size), (14, 16, 18))
     d = ImageDraw.Draw(im)
@@ -505,16 +516,19 @@ def main():
     ap.add_argument("--http-port", type=int, default=8080, help="port browsers use")
     ap.add_argument("--no-draw", action="store_true",
                     help="serve frames unannotated (boxes still on /api/status)")
-    ap.add_argument("--ccm", type=float, default=1.0,
-                    help="OV5647 colour-correction strength: 1.0 full (default), "
-                         "0 off, values between soften it in dim scenes where the "
-                         "matrix amplifies chroma noise")
+    ap.add_argument("--ccm", type=float, default=None,
+                    help="OV5647 colour-correction strength. The default is AUTO: "
+                         "each frame says how much chroma the Jetson's ISP already "
+                         "applied and only the remainder is done here, which is "
+                         "what stops a boosted frame being corrected twice. Give a "
+                         "number to override -- 0 off, 1.0 full -- but 1.0 against "
+                         "an ISP-boosted frame clips about half of it.")
     args = ap.parse_args()
 
-    ccm = max(0.0, args.ccm)
-    if ccm > 0.0 and np is None:
-        print("[warn] numpy not installed, so --ccm is off and colours will look "
-              "washed out; pip install numpy", flush=True)
+    ccm = None if args.ccm is None else max(0.0, args.ccm)
+    if ccm != 0.0 and np is None:
+        print("[warn] numpy not installed, so colour correction is off and colours "
+              "will look washed out; pip install numpy", flush=True)
         ccm = 0.0
 
     threading.Thread(target=ingest_server,

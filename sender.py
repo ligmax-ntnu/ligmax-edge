@@ -222,7 +222,8 @@ def build_pipeline(args, w, h, fps, crops, net_w, net_h, pw, ph):
         # working before this change.
         chunks.append(
             f"nvarguscamerasrc name=cam{sid} sensor-id={sid} sensor-mode={args.mode} "
-            f"wbmode={WB_MODES.index(args.wb)} do-timestamp=true "
+            f"wbmode={WB_MODES.index(args.wb)} saturation={args.saturation} "
+            f"do-timestamp=true "
             f"! video/x-raw(memory:NVMM),width={w},height={h},framerate={fps}/1,format=NV12 "
             f"! nvvideoconvert{flip} "
             f"! video/x-raw(memory:NVMM),width={w},height={h},format=NV12 "
@@ -547,6 +548,20 @@ def main():
                          "from a frame that does not line up is worse than none.")
     ap.add_argument("--no-rotate", action="store_true",
                     help="upright mount; skip the 180 degree rotation")
+    ap.add_argument("--saturation", type=float, default=2.0,
+                    help="Argus chroma gain, 0-2, applied in the ISP. Defaults to "
+                         "the maximum, and that is deliberate: JetPack ships no "
+                         "ISP tuning for the OV5647, so Argus returns near "
+                         "sensor-native RGB at about a third of the chroma a "
+                         "normal camera gives -- and the detector was trained on "
+                         "normal cameras, so washed-out is OFF-DISTRIBUTION for "
+                         "it. This is the only colour knob upstream of inference "
+                         "and it is free (the ISP is already converting), whereas "
+                         "the matrix in fusion.py is affordable for 400 lidar "
+                         "points but not for 819k detector pixels. Measured over "
+                         "real frames: chroma 30.1 -> 59.9, clipping 0.0 -> 2.8%. "
+                         "Set 1.0 to restore the old sensor-native behaviour; "
+                         "fusion picks up the rest of the correction either way.")
     ap.add_argument("--wb", default="daylight", choices=WB_MODES,
                     help="Argus white balance. Pinned rather than auto because the "
                          "detector classifies by colour and auto WB shifting hue "
@@ -562,6 +577,18 @@ def main():
                          "confidence first; the rest are reported unclassified.")
     ap.add_argument("--stats-every", type=float, default=5.0)
     args = ap.parse_args()
+
+    # Argus rejects the whole pipeline for an out-of-range saturation rather than
+    # clamping, so a typo here would read as "the cameras are dead" 40 s later.
+    args.saturation = max(0.0, min(2.0, args.saturation))
+    # What is left for the matrix to do once the ISP has boosted chroma. Computed
+    # ONCE and carried on the wire, so no consumer has to guess how much
+    # correction is already baked into the pixels it was handed.
+    ccm_strength = fusion.ccm_strength_for(args.saturation)
+    print(f"colour: ISP saturation {args.saturation:.2f}, "
+          f"OV5647 matrix at {ccm_strength:.2f} strength "
+          f"({'sensor-native' if args.saturation == 1.0 else 'ISP-boosted'} pixels "
+          f"into the detector)")
 
     # SIGTERM has to land in the same place Ctrl-C does. Python's default for it
     # exits the interpreter outright, so the `finally` below never runs, the
@@ -897,7 +924,8 @@ def main():
                     try:
                         pts = fusion.fuse(sweep, rig, views,
                                           max_skew=args.lidar_max_skew / 1000.0,
-                                          t_caps=t_caps, build_cloud=fresh)
+                                          t_caps=t_caps, build_cloud=fresh,
+                                          ccm_strength=ccm_strength)
                     except Exception:           # geometry must never kill a frame
                         est_err[0] += 1
                         pts = None
@@ -940,6 +968,12 @@ def main():
                     "crop": list(crops[i]),
                     "full_w": w, "full_h": h,
                     "refined": ys[i] is not None,
+                    # How much chroma the ISP already applied, so a viewer knows
+                    # how much of the OV5647 matrix is left to apply and cannot
+                    # correct twice. Correcting twice is not cosmetic: measured at
+                    # saturation 2.0 with a full matrix on top, 53% of the frame
+                    # clips.
+                    "saturation": args.saturation,
                     "fps": round(fps_meas, 2),
                     "dets": items,
                 }, jpeg)

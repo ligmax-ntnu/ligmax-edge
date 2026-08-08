@@ -121,6 +121,44 @@ class Camera:
         v[~ok] = np.nan
         return v
 
+    def to_net(self, uv_full):
+        """Full sensor pixels -> detector-input pixels. Inverse of `to_full`.
+
+        The result is deliberately NOT clipped to the network frame: a point can
+        project to a real pixel on the sensor that the detector's crop does not
+        cover, and the caller needs to see that it fell outside rather than have
+        it clamped onto the border.
+        """
+        uv = np.asarray(uv_full, dtype=np.float64).reshape(-1, 2)
+        return np.stack([(uv[:, 0] - self.crop[0]) / self.scale,
+                         (uv[:, 1] - self.crop[1]) / self.scale], axis=1)
+
+    def project(self, p_cam):
+        """Camera-frame 3D points -> (uv_full, valid). The inverse of `rays`.
+
+        Forward Kannala-Brandt: theta off the optical axis, radius r = theta *
+        poly(theta), placed at azimuth phi around the principal point. Points
+        behind the camera need no special case -- theta comes out past 90 deg and
+        so fails the cone test below, which is the honest answer rather than the
+        fold-back cv2.fisheye would produce (see the README: 110 deg lands at the
+        same radius as 70 deg, silently).
+
+        `valid` is the calibrated cone (88 deg here), not the image rectangle.
+        Whether a pixel is actually inside the crop is a separate question and
+        belongs to the caller, which knows what it is sampling.
+        """
+        p = np.asarray(p_cam, dtype=np.float64).reshape(-1, 3)
+        rxy = np.hypot(p[:, 0], p[:, 1])
+        # atan2, not acos(z/|p|): correct through and past 90 deg, and it does
+        # not lose precision for points near the optical axis.
+        theta = np.arctan2(rxy, p[:, 2])
+        phi = np.arctan2(p[:, 1], p[:, 0])
+        r_d = _kb_radial(theta, self.D)
+        uv = np.stack([self.K[0, 0] * r_d * np.cos(phi) + self.K[0, 2],
+                       self.K[1, 1] * r_d * np.sin(phi) + self.K[1, 2]], axis=1)
+        valid = (theta <= self.theta_max) & np.isfinite(uv).all(axis=1)
+        return uv, valid
+
     def bearing(self, uv_full):
         """-> (azimuth_deg, elevation_deg, field_angle_deg), NaN outside the cone.
 

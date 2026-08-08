@@ -69,7 +69,22 @@ if [ "$NO_CLOUD" = "1" ]; then
   CLOUD_ARG=(--no-cloud)
 fi
 
+# Lidar is OPT-IN here, deliberately, even though the sender defaults it on.
+#
+# Switching it on puts a new message type on the link to the Pi (protocol.py
+# KIND_LIDAR: no `cam` field, empty JPEG payload). A consumer that reads
+# `header["cam"]` without checking `kind` first will file every sweep as camera 0
+# and blank that feed -- receiver.py in this repo had exactly that bug until the
+# lidar was added. So the Pi has to learn the message before this is turned on,
+# and turning it on is a decision rather than a side effect of deploying.
+#
+#   LIDAR=1 ./run.sh          once ligmax-pi3 dispatches on `kind`
+LIDAR_ARG=(--no-lidar)
+if [ "${LIDAR:-0}" = "1" ]; then
+  LIDAR_ARG=()
+fi
+
 echo
 exec ./.venv/bin/python sender.py \
   --host "$HOST" --port "$PORT" --mode "$MODE" --preview "$PREVIEW" \
-  "${CLOUD_ARG[@]}" "$@"
+  "${CLOUD_ARG[@]}" "${LIDAR_ARG[@]}" "$@"

@@ -113,6 +113,19 @@ class Latest:
         self.frames = {}        # cam -> (version, jpeg_bytes, header)
         self.version = 0
         self.stats = {}         # cam -> dict
+        self.lidar = None       # newest sweep payload (protocol.KIND_LIDAR)
+        self.lidar_n = 0
+
+    def put_lidar(self, sweep):
+        with self.cv:
+            self.lidar = sweep
+            self.lidar_n += 1
+            self.version += 1
+            self.cv.notify_all()
+
+    def lidar_snapshot(self):
+        with self.cv:
+            return self.lidar, self.lidar_n
 
     def put(self, cam, jpeg, header):
         with self.cv:
@@ -176,6 +189,69 @@ def render(jpeg, header, draw, ccm):
     return out.getvalue()
 
 
+def render_lidar(sweep, size=520, max_range=12.0):
+    """Top-down plot of one sweep, each return in the colour a camera gave it.
+
+    Top-down rather than an overlay on a camera frame because most of a rotation
+    is behind both cameras -- an image overlay can only ever show the third of the
+    sweep that a lens covers. Use test/test_lidar_overlay.py on the Jetson for
+    that view; it is the one for checking rig.json, and it needs the geometry.
+
+    Rig frame: +x starboard, +z forward, so the plot is +z up and +x right, which
+    is the view from above with the bow at the top.
+    """
+    im = Image.new("RGB", (size, size), (14, 16, 18))
+    d = ImageDraw.Draw(im)
+    cx = cy = size / 2.0
+    scale = (size / 2.0 - 18) / max_range
+
+    for ring in range(2, int(max_range) + 1, 2):
+        r = ring * scale
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(44, 50, 56))
+        d.text((cx + 3, cy - r - 11), f"{ring} m", fill=(90, 100, 110))
+    d.line([cx, 0, cx, size], fill=(44, 50, 56))
+    d.line([0, cy, size, cy], fill=(44, 50, 56))
+    d.text((cx + 4, 4), "bow", fill=(90, 100, 110))
+
+    if not sweep:
+        d.text((10, size - 16), "no sweep yet", fill=(160, 140, 100))
+        return im
+
+    xs, zs = sweep.get("x") or [], sweep.get("z") or []
+    rgb = sweep.get("rgb") or []
+    cam = sweep.get("cam") or []
+    det = sweep.get("det") or []
+    for i in range(min(len(xs), len(zs))):
+        px = cx + xs[i] * scale
+        py = cy - zs[i] * scale
+        if not (0 <= px < size and 0 <= py < size):
+            continue
+        c = int(cam[i]) if i < len(cam) else -1
+        if c < 0:
+            # No camera saw it. Still a real obstacle, so it is drawn -- just in
+            # the colour of "the lidar alone knows this is here".
+            col = (105, 115, 125)
+            rad = 1.4
+        else:
+            col = tuple(rgb[3 * i:3 * i + 3]) if 3 * i + 2 < len(rgb) else (200, 200, 200)
+            rad = 1.8
+        if i < len(det) and det[i] >= 0:
+            rad = 3.2      # attributed to a detection: this return is a known buoy
+            d.ellipse([px - rad - 2, py - rad - 2, px + rad + 2, py + rad + 2],
+                      outline=(250, 220, 60))
+        d.ellipse([px - rad, py - rad, px + rad, py + rad], fill=col)
+
+    d.ellipse([cx - 3, cy - 3, cx + 3, cy + 3], fill=(240, 240, 240))
+    skew = sweep.get("skew_ms") or []
+    tag = (f"{sweep.get('n', 0)} pts  {sweep.get('coloured', 0)} coloured  "
+           f"{sweep.get('hz') or 0:.1f} Hz")
+    if skew and skew[0] is not None:
+        tag += f"  skew {skew[0]:+.0f} ms"
+    d.rectangle([0, size - 15, d.textlength(tag) + 6, size], fill=(0, 0, 0))
+    d.text((3, size - 14), tag, fill=(230, 230, 230))
+    return im
+
+
 def draw_overlay(im, header):
     """Draw boxes, labels and the per-camera tag onto an RGB image, in place."""
     net_w = header.get("net_w") or im.width
@@ -218,6 +294,12 @@ def ingest(conn, addr, draw, ccm):
             if msg is None:
                 break
             header, jpeg = msg
+            # Dispatch on kind BEFORE reading `cam`. A lidar message has no `cam`,
+            # and defaulting it to 0 would file an empty payload as camera 0 and
+            # blank that feed at the sweep rate.
+            if header.get("kind") == protocol.KIND_LIDAR:
+                LATEST.put_lidar(header.get("lidar"))
+                continue
             cam = int(header.get("cam", 0))
             jpeg = render(jpeg, header, draw, ccm)
             LATEST.put(cam, jpeg, header)
@@ -258,6 +340,7 @@ PAGE = """<!doctype html>
   #status { color:#9a9; font-variant-numeric:tabular-nums; }
   .wrap { display:flex; flex-wrap:wrap; gap:10px; padding:10px; }
   figure { margin:0; flex:1 1 480px; min-width:320px; }
+  figure.lidar { flex:0 1 380px; }
   figcaption { padding:4px 2px; color:#9a9; font-size:12px; }
   img { width:100%; height:auto; display:block; background:#000; border-radius:4px; }
 </style>
@@ -282,17 +365,37 @@ function build(cams) {
     wrap.appendChild(f);
   }
 }
+// The lidar tile is polled rather than streamed: one sweep a frame is plenty to
+// look at, and it keeps the MJPEG connections for the cameras alone.
+let lidarTile = null;
+function showLidar(on) {
+  if (on && !lidarTile) {
+    lidarTile = document.createElement('figure');
+    lidarTile.className = 'lidar';
+    lidarTile.innerHTML = '<img id="lidarimg" alt="lidar, top down">'
+      + '<figcaption>lidar &mdash; top down, bow up, colour from the cameras</figcaption>';
+    document.getElementById('wrap').appendChild(lidarTile);
+    setInterval(() => {
+      const el = document.getElementById('lidarimg');
+      if (el) el.src = '/lidar.jpg?t=' + Date.now();
+    }, 400);
+  }
+}
 let shown = '';
 async function poll() {
   try {
     const r = await fetch('/api/status', {cache:'no-store'});
     const j = await r.json();
     const key = j.cameras.join(',');
-    if (key !== shown) { shown = key; build(j.cameras); }
-    document.getElementById('status').textContent = j.cameras.length
+    if (key !== shown) { shown = key; build(j.cameras); lidarTile = null; }
+    if (j.lidar) showLidar(true);
+    let s = j.cameras.length
       ? j.cameras.map(c => 'cam'+c+': '+(j.fps[c]||0).toFixed(1)+' fps, '
           + (j.dets[c]||0) + ' det').join('   |   ')
       : 'waiting for the Jetson';
+    if (j.lidar) s += '   |   lidar: ' + j.lidar.n + ' pts, '
+      + j.lidar.coloured + ' coloured, ' + (j.lidar.hz||0).toFixed(1) + ' Hz';
+    document.getElementById('status').textContent = s;
   } catch (e) {
     document.getElementById('status').textContent = 'viewer unreachable';
   }
@@ -325,13 +428,30 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             import json
             snap = LATEST.snapshot()
+            sweep, seen = LATEST.lidar_snapshot()
             body = json.dumps({
                 "cameras": sorted(snap),
                 "fps": {c: round(st.get("fps", 0.0), 2) for c, (_, st) in snap.items()},
                 "dets": {c: len(hdr.get("dets", [])) for c, (hdr, _) in snap.items()},
                 "detail": {c: hdr.get("dets", []) for c, (hdr, _) in snap.items()},
+                "lidar": None if not sweep else {
+                    "sweeps": seen, "n": sweep.get("n"),
+                    "coloured": sweep.get("coloured"), "hz": sweep.get("hz"),
+                    "skew_ms": sweep.get("skew_ms"),
+                },
             }).encode()
             self._send(body, "application/json")
+            return
+        if path == "/api/lidar":
+            import json
+            sweep, _ = LATEST.lidar_snapshot()
+            self._send(json.dumps(sweep).encode(), "application/json")
+            return
+        if path == "/lidar.jpg":
+            sweep, _ = LATEST.lidar_snapshot()
+            out = io.BytesIO()
+            render_lidar(sweep).save(out, format="JPEG", quality=85)
+            self._send(out.getvalue(), "image/jpeg")
             return
         if path.startswith("/cam") and path.endswith("/stream"):
             try:

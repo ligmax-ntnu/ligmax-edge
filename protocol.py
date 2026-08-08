@@ -1,6 +1,6 @@
 """Wire format shared by sender and receiver.
 
-One message per camera frame, over a plain TCP stream:
+One message per camera frame, plus one per lidar sweep, over a plain TCP stream:
 
     magic   4 bytes   b'BUOY'
     hdrlen  4 bytes   big-endian uint32
@@ -11,7 +11,13 @@ Length-prefixed rather than newline-delimited because the payload is binary JPEG
 Magic first so a receiver that loses sync can hunt for the next frame boundary
 instead of giving up.
 
-Header fields:
+`kind` says which message this is: KIND_FRAME (a camera frame, with a JPEG) or
+KIND_LIDAR (a sweep, with an empty payload). A header without `kind` is a camera
+frame, which is what every sender before the lidar existed emitted -- read it that
+way rather than rejecting it. DISPATCH ON `kind` BEFORE TOUCHING `cam`: a lidar
+message has no `cam`, because most of a rotation is behind both cameras.
+
+Header fields (KIND_FRAME):
     cam          int    0 or 1
     seq          int    monotonic per camera
     ts           float  == t_capture; kept under the old name for compatibility
@@ -84,6 +90,69 @@ uniform scale is correct.
 
 `card`/`card_conf` are present only for cardinal detections that went through the
 second-stage classifier; otherwise null.
+
+A detection that the lidar also saw gains a `lidar` block, which does NOT replace
+`range` -- the two are independent measurements and a consumer that can see both
+can tell when they disagree. Inside the C1's 12 m the lidar is better by an order
+of magnitude (+-3 cm flat, against +-5 % at 10 m rising as z**2):
+
+    n            returns inside the detection's box
+    n_used       of those, the foreground cluster -- see `mixed`
+    range_m      median range of that cluster, metres
+    sigma_m      its uncertainty, floored at the sensor's 3 cm accuracy
+    nearest_m    closest single return; the one that matters for not hitting it
+    spread_m     depth spread across the cluster
+    mixed        true when the box also held returns from well behind the target,
+                 i.e. sea showing through around the buoy. The range is the near
+                 cluster's, but a large gap is also how a box drawn around the
+                 wrong thing announces itself.
+    bearing_deg  azimuth in the RIG frame, not the camera frame
+    cam          which camera's box this was matched against
+
+Lidar messages (KIND_LIDAR)
+---------------------------
+One per rotation, ~10 Hz (the C1's settled rate), `jpeg_bytes` 0. Beyond
+{kind, seq, ts, t_sent} the header carries `lidar`, holding a COLUMNAR point
+cloud -- parallel arrays, not a list of objects, because at ~400 points a sweep
+the repeated keys would be most of the bytes:
+
+    seq, n, coloured    sweep number, points, how many the cameras could colour
+    in_time             points measured close enough in time to a frame to be
+                        colourable at all. `n - in_time` is a TIMING shortfall;
+                        `in_time - coloured` is simply the part of the rotation
+                        no lens covers, which is most of it and expected.
+    frame               "rig" -- +x starboard, +y DOWN, +z forward, origin at the
+                        lidar unless rig.json moves it. NOT a camera frame.
+    t_start, t_end      epoch seconds. A rotation takes ~100 ms -- LONGER than a
+                        camera frame -- and is emphatically not an instant, which
+                        is what dt_ms below is for
+    hz                  measured rotation rate
+    skew_ms             [cam0, cam1] sweep-to-frame capture-time difference. The
+                        number to watch: colour is only meaningful while it is
+                        small, and past --lidar-max-skew the points ship with
+                        cam = -1 rather than a colour sampled from a frame that
+                        does not line up.
+    x, y, z             metres in the rig frame, one entry per point
+    dt_ms               ms after t_start that each point was measured, from its
+                        angle around the rotation. Use it for anything geometric
+                        on a moving boat, exactly as t_row is used per detection.
+    q                   the C1's own return-strength figure
+    cam                 0, 1, or -1 for a point no camera could see or colour
+    rgb                 FLAT r,g,b,r,g,b... so it is 3*n long, not n. Sensor-native
+                        values straight off the detector frame: the OV5647 colour
+                        matrix runs at the receiver, so these are not calibrated
+                        colours, they are the same numbers the boxes were drawn
+                        from. (0,0,0) where cam is -1.
+    det                 track id of the detection this return belongs to, or -1.
+                        Only foreground returns are tagged, so the sea visible
+                        through a box is not attributed to the buoy.
+                        KEY IT WITH `cam`, not on its own: track ids are unique
+                        per camera and not across the pair (see `id` above), so
+                        cam0's #7 and cam1's #7 are different buoys. The pair
+                        (cam[i], det[i]) is what identifies a target.
+
+Returns with distance 0 -- about a third of every rotation, the sensor saying it
+got no usable echo -- are dropped at the driver and never reach the wire.
 """
 
 import json
@@ -91,6 +160,9 @@ import struct
 
 MAGIC = b"BUOY"
 _HDR = struct.Struct(">4sI")
+
+KIND_FRAME = "frame"
+KIND_LIDAR = "lidar"
 
 CLASS_NAMES = {0: "green", 1: "red", 2: "cardinal"}
 CARDINAL_NAMES = {0: "east", 1: "north", 2: "south", 3: "west"}

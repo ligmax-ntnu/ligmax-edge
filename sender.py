@@ -59,6 +59,7 @@ import json
 import math
 import os
 import queue
+import signal
 import socket
 import sys
 import threading
@@ -82,6 +83,8 @@ gi.require_version("GstVideo", "1.0")
 from gi.repository import GLib, Gst, GstApp, GstVideo  # noqa: E402,F401
 
 import estimate
+import fusion
+import lidar as lidar_mod
 import protocol
 from trt import Engine
 
@@ -445,6 +448,21 @@ def _cloud_line(cloud):
     return "/".join(parts)
 
 
+def _lidar_line(reader, lit, skew_ms, fuse_ms):
+    """Points, how many the cameras could colour, and the frame-to-sweep skew.
+
+    `skew` is the one to watch: it is how far apart in capture time the sweep and
+    the frame that coloured it were, and it is the number that goes wrong quietly
+    if the sweep buffer is ever too short for the camera pipeline's latency.
+    """
+    st = reader.stats()
+    if not st["healthy"]:
+        return f"DOWN({st['last_error'] or 'connecting'})"
+    return (f"{st['points']}pts/{st['hz']:.1f}Hz lit={lit} "
+            f"skew={skew_ms:.0f}ms fuse={fuse_ms:.1f}ms"
+            + (f" err={st['errors']}" if st["errors"] else ""))
+
+
 def main():
     ap = argparse.ArgumentParser()
     # The Pi, which fuses these detections with the aft lidar before anything
@@ -497,6 +515,21 @@ def main():
                          "reading active rows, used for the per-detection timestamp. "
                          "~0.9 on the OV5647 at full resolution, so the bottom of "
                          "the frame is exposed ~60 ms after the top.")
+    ap.add_argument("--no-lidar", action="store_true",
+                    help="do not open the RPLidar C1 at all: no point cloud on the "
+                         "wire and no lidar range on any detection")
+    ap.add_argument("--lidar-port", default=None,
+                    help="override config.lidar_port() (the udev symlink)")
+    ap.add_argument("--rig", default="rig.json",
+                    help="hand-measured lidar/camera mounting geometry. Without it "
+                         "there is no way to say where a return lands in an image, "
+                         "so the sweep ships uncoloured and detections get no range.")
+    ap.add_argument("--lidar-max-skew", type=float, default=40.0,
+                    help="milliseconds a sweep and a frame may differ in capture "
+                         "time and still be colourised together. Points outside it "
+                         "are still sent, just uncoloured -- a return is valid "
+                         "whatever the cameras were doing, but a colour sampled "
+                         "from a frame that does not line up is worse than none.")
     ap.add_argument("--no-rotate", action="store_true",
                     help="upright mount; skip the 180 degree rotation")
     ap.add_argument("--wb", default="daylight", choices=WB_MODES,
@@ -514,6 +547,15 @@ def main():
                          "confidence first; the rest are reported unclassified.")
     ap.add_argument("--stats-every", type=float, default=5.0)
     args = ap.parse_args()
+
+    # SIGTERM has to land in the same place Ctrl-C does. Python's default for it
+    # exits the interpreter outright, so the `finally` below never runs, the
+    # pipeline is never drained with EOS, and Argus latches into the error state
+    # that only a power cycle clears (README). That is not a theoretical path: it
+    # is what `systemctl restart`, `systemctl stop`, and the dashboard's Update
+    # button all do -- update.py SIGTERMs the process group before it pulls. So
+    # turn it into the KeyboardInterrupt the shutdown code already handles.
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
 
     w, h, fps = SENSOR[args.mode]
     pw, ph = (int(v) for v in args.preview.split("x"))
@@ -590,6 +632,21 @@ def main():
     print(f"preview {pw}x{ph} q{args.quality} -> {args.host}:{args.port}")
     do_est = any(c is not None for c in cams)
 
+    # The lidar. Its geometry is a separate, HAND-MEASURED thing from the fisheye
+    # intrinsics: rig.json says where the sensors are relative to each other, the
+    # cam*.json fits say what each lens does. Both are needed to put a return on a
+    # pixel, so a missing rig file disables colour but not capture.
+    rig, reader = None, None
+    if not args.no_lidar:
+        try:
+            rig = fusion.Rig.load(args.rig)
+            print(f"rig {args.rig}:\n{rig.describe()}")
+        except OSError as e:
+            print(f"[warn] no rig geometry ({e}); the sweep will ship uncoloured "
+                  f"and detections get no lidar range", file=sys.stderr)
+        reader = lidar_mod.LidarReader(args.lidar_port)
+        reader.start()      # connects on its own thread; never blocks capture
+
     Gst.init(None)
     desc = build_pipeline(args, w, h, fps, crops, net_w, net_h, pw, ph)
     try:
@@ -638,6 +695,12 @@ def main():
     y_cache = [{}, {}]      # full-res Y planes keyed by PTS
     y_stale = [0, 0]        # detector frames with no matching full-res frame
     est_err = [0]
+    last_sweep = 0          # sweep already on the wire; frames outrun sweeps slightly
+    lidar_seq = 0
+    lidar_skew = 0.0        # ms, |sweep t_mid - frame t_capture|, last fused
+    lidar_lit = 0           # points of the last sweep that got a colour
+    fuse_ms = 0.0           # time in the fusion block, summed over the window
+    fuse_n = 0
     frames = 0
     t_stats = time.monotonic()
     fps_meas = 0.0
@@ -723,6 +786,7 @@ def main():
             now = time.time()
             frames += 1
 
+            per_cam = []
             for i in (0, 1):
                 rows = out[i]
                 keep = rows[rows[:, 4] >= args.conf]
@@ -762,7 +826,53 @@ def main():
                             est_err[0] += 1
                             d["estimate_error"] = str(e)[:120]
                     items.append(d)
+                per_cam.append(items)
 
+            # ---- lidar fusion, between building the detections and sending them,
+            # because it writes a range onto detections in BOTH cameras and needs
+            # both frames to decide which one colours each return.
+            #
+            # The sweep is chosen by TIME against this frame's t_capture, not by
+            # "the newest one". The camera pipeline runs ~250 ms behind the photons
+            # and the lidar does not, so the newest sweep is a quarter-second in
+            # front of the frame -- 0.75 m of registration error at 3 m/s, on a
+            # sensor whose whole range is 12 m. LidarReader keeps a couple of
+            # seconds of sweeps for exactly this lookup.
+            cloud_pts = None
+            if reader is not None and rig is not None:
+                t_fuse0 = time.perf_counter()
+                t_caps = [clock.frame_time(ptss[i]) for i in (0, 1)]
+                sweep, _ = reader.sweep_near(t_caps[0])
+                if sweep is not None:
+                    views = [fusion.View(i, cams[i], rgbs[i], per_cam[i])
+                             for i in (0, 1)]
+                    # Fuse on EVERY frame, so detections always carry a lidar
+                    # range -- but build the point cloud only for a sweep the Pi
+                    # has not had yet. The C1 settles at 10 Hz against 14 fps, so
+                    # roughly three frames in ten are nearest to a sweep an
+                    # earlier frame already sent; those still get their ranges,
+                    # they just do not re-serialise a rotation nobody will read.
+                    fresh = sweep.seq != last_sweep
+                    try:
+                        pts = fusion.fuse(sweep, rig, views,
+                                          max_skew=args.lidar_max_skew / 1000.0,
+                                          t_caps=t_caps, build_cloud=fresh)
+                    except Exception:           # geometry must never kill a frame
+                        est_err[0] += 1
+                        pts = None
+                    lidar_skew = 1000.0 * abs(sweep.t_mid - t_caps[0])
+                    if fresh and pts is not None:
+                        last_sweep = sweep.seq
+                        lidar_lit = pts["coloured"]
+                        cloud_pts = pts
+                # Kept on the stats line, not just measured once: this is the
+                # only part of the frame budget the lidar can eat, and the budget
+                # has ~10 ms of slack in it.
+                fuse_ms += 1000.0 * (time.perf_counter() - t_fuse0)
+                fuse_n += 1
+
+            for i in (0, 1):
+                items = per_cam[i]
                 jpeg = jpeg_cache[i].pop(ptss[i], None)
                 if jpeg is None and jpeg_cache[i]:
                     # Fall back to the newest preview if the exact PTS is missing;
@@ -777,6 +887,7 @@ def main():
                 # stays visible instead of being folded into the measurement.
                 t_cap = clock.frame_time(ptss[i])
                 tx.submit({
+                    "kind": protocol.KIND_FRAME,
                     "cam": i, "seq": seq[i],
                     "ts": round(t_cap, 6),
                     "t_capture": round(t_cap, 6),
@@ -799,6 +910,17 @@ def main():
                 if cloud is not None:
                     cloud.submit(i, jpeg, pw, ph, t_cap)
 
+            # The sweep goes as its own message rather than riding on a camera
+            # frame: it belongs to neither camera (most of a rotation is behind
+            # both of them), it arrives at its own rate, and duplicating it onto
+            # both frames would double a payload that is already the larger half
+            # of the header. Same framing, empty payload -- see protocol.py.
+            if cloud_pts is not None:
+                lidar_seq += 1
+                tx.submit({"kind": protocol.KIND_LIDAR, "seq": lidar_seq,
+                           "ts": cloud_pts["t_start"], "t_sent": round(now, 6),
+                           "lidar": cloud_pts}, b"")
+
             el = time.monotonic() - t_stats
             if el >= args.stats_every:
                 fps_meas = frames / el
@@ -808,9 +930,12 @@ def main():
                       f"stale_full={y_stale[0]}/{y_stale[1]} "
                       f"est_err={est_err[0]} "
                       f"link={'up' if tx.connected else 'DOWN'}"
+                      + (f"  lidar={_lidar_line(reader, lidar_lit, lidar_skew, fuse_ms / max(fuse_n, 1))}"
+                         if reader else "")
                       + (f"  cloud={_cloud_line(cloud)}" if cloud else ""),
                       flush=True)
                 frames, cards = 0, 0
+                fuse_ms, fuse_n = 0.0, 0
                 t_stats = time.monotonic()
     except KeyboardInterrupt:
         print("\nstopping")
@@ -822,6 +947,11 @@ def main():
         pipe.set_state(Gst.State.NULL)
         pipe.get_state(3 * Gst.SECOND)
         tx.shutdown()
+        if reader is not None:
+            # STOP and drain the C1 before the port closes, or it keeps streaming
+            # into a dead port and the next run inherits the mess -- see lidar.py.
+            reader.shutdown()
+            reader.join(timeout=3.0)
         if cloud is not None:
             cloud.close()
         det.close()

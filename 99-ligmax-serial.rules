@@ -1,0 +1,17 @@
+# Stable device name for the RPLidar C1's USB-serial adapter, independent of
+# enumeration order and of whatever else happens to be plugged in. See the
+# module docstring in test/test_lidar.py and config.py, which reads this path.
+#
+# Install:
+#   sudo cp 99-ligmax-serial.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   (or just unplug/replug the sensor)
+#
+# Keyed to this specific adapter's serial number (ATTRS{serial}), not to
+# idVendor/idProduct alone: the CP2102N is a generic USB-UART bridge, so
+# matching on vendor/product would also claim any other CP2102N on the board.
+#
+# GROUP="plugdev" rather than the usual "dialout": it's what jadmin already
+# belongs to on the Jetson image, and adding a device-specific rule is less
+# to reason about than adding the account to a new group.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{serial}=="ea6d25d25a6eef118206e3c2c169b110", SYMLINK+="ligmax-lidar", GROUP="plugdev", MODE="0660"

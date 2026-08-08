@@ -161,6 +161,107 @@ better — a buoy at 100 m with a 2 m camera height sits 20 mrad ≈ 16 px below
 horizon, giving ~6 % instead of 22 % — but it needs camera height and attitude.
 `../camera-test/horizon/` has the horizon detection for it.
 
+## Lidar, and colouring it from the cameras
+
+An RPLidar C1 on the front, read by [lidar.py](lidar.py), projected into both
+cameras by [fusion.py](fusion.py), and sent to the Pi as its own message type
+alongside the detections. Two products come out of it:
+
+* **A colourised point cloud.** A 2D scanner returns a range and nothing else, so
+  a wall, a buoy and a person are the same measurement. The cameras say which.
+* **A true range on any detection the lidar can see.** Range from apparent size
+  is ±5 % at 10 m and degrades as z²; the C1 is ±3 cm flat. Inside its 12 m the
+  lidar wins by an order of magnitude, so detections gain a `lidar` block —
+  *alongside* `range`, never replacing it, because two independent measurements
+  that disagree are worth being able to notice.
+
+```bash
+./.venv/bin/python lidar.py --seconds 5      # sweep summaries; sensor only
+./sender.py --no-lidar                       # pipeline with the lidar switched off
+```
+
+Measured on this unit, **once settled: 10.0 Hz, ~400 returns per rev at 0.9°**,
+about a third of which come back with distance 0 (no echo) and are dropped in the
+driver. Measure it *after* it settles — the C1 comes up nearer 14 Hz and slows
+over the first few seconds, so a short run reports a rate it does not hold.
+
+### Time, which is where this goes wrong quietly
+
+A rotation takes **100 ms — longer than a camera frame** — and a camera frame
+reaches the fusion code ~250 ms after its photons landed. Both matter:
+
+* The sweep is chosen **by capture time** out of a two-second buffer, not by
+  "the newest one". Newest is ~250 ms ahead of the frame, which at 3 m/s is
+  0.75 m of registration error on a sensor whose whole range is 12 m.
+* The colour gate is **per point, not per sweep**. Every return carries its own
+  timestamp (`dt_ms`, interpolated by angle). Gating on the sweep as a whole
+  cannot work: a 100 ms rotation's midpoint is up to 50 ms from any frame no
+  matter how well the two are running, so colour would switch off permanently
+  while nothing was wrong.
+
+`skew=` on the stats line is the sweep-to-frame capture-time difference, and
+`in_time` on the wire separates the two reasons a return has no colour — measured
+at the wrong moment (timing, investigate) versus outside every lens (geometry,
+expected, since most of a rotation is behind both cameras).
+
+### What it costs
+
+The lidar is **not free**, and unlike the bearing/range work it is measurable.
+Measured on this board, alternating runs of 34 s, no receiver attached:
+
+| | fps/cam |
+| --- | --- |
+| `--no-lidar` | **13.0–13.5** |
+| reader thread only (no fusion) | 12.5 |
+| reader + fusion | **11.0–11.75** |
+
+So roughly **12 ms of the 71.4 ms frame period**, of which ~4.5 ms is `fuse()`
+itself (timed directly — it is the `fuse=` field on the stats line) and ~3 ms is
+the reader thread competing for the GIL; the rest is scheduling. Run-to-run
+spread is ±0.5 fps, so treat these as approximate.
+
+Two rounds of optimisation are already in: the columnar arrays are built with
+`np.round(...).tolist()` rather than a per-element comprehension (5.11 → 3.34 ms),
+and each camera projects only the points in front of it rather than the whole
+rotation (3.34 → 2.97 ms isolated). The remaining cost is many small numpy calls
+on ~400-point arrays, where per-call dispatch overhead dominates on an ARM core.
+
+**`--no-lidar` restores the old frame rate exactly** if you ever need it back.
+11.4 fps/cam is still comfortably above the C1's own 10 Hz, so the fusion is not
+losing sweeps — it is spending camera frames.
+
+### Mounting geometry
+
+[rig.json](rig.json) — hand-measured, and the file to edit when anything is
+re-bolted. Everything is in a **rig frame** (`+x` starboard, `+y` **down**, `+z`
+forward, origin at the lidar), which is also the frame the point cloud ships in,
+so the Pi can merge it with the aft lidar without guessing.
+
+Defaults: cameras horizontal, ±15° either side of forward, 5 cm from the lidar
+centre along their own pointing direction and 5 cm above the scan plane. The
+lidar body is mounted rotated **45° to port**, so `lidar.yaw_deg` is `-45` to
+turn the scan back onto the boat's axes. `cam0` and `cam1` are written out in
+full rather than mirrored, so each absorbs its own mounting error independently.
+
+Nothing downstream can tell you these numbers are wrong — a slightly wrong
+transform still produces a full, plausible, entirely mis-registered cloud. So
+check them:
+
+```bash
+./.venv/bin/python test/test_lidar_overlay.py            # both cameras
+./.venv/bin/python test/test_lidar_overlay.py --yaw 12.5 # sweep a value, no edit
+```
+
+It draws the returns onto a real frame, coloured by range. Put a hard vertical
+edge 1–3 m out; the returns must land *on* it. Points consistently left or right
+→ yaw; above or below and converging with range → `dy`; the whole world mirrored
+→ `angle_dir`; rotated by a constant → `yaw_deg` or `angle_zero_deg`.
+
+The colour lookup goes through the **calibrated Kannala-Brandt model**, not a
+pinhole approximation — at 60° off axis a pinhole would land 356 px wrong in a
+1280-wide frame. Returns outside the 88° valid cone get no colour rather than a
+plausible wrong one.
+
 ## Calibration
 
 [calibrate/](calibrate/) fits a Kannala-Brandt fisheye model per camera. The results
@@ -318,7 +419,13 @@ on and is worth an experiment rather than an assumption.
   conversion path and surfaces as `cudaErrorIllegalAddress` inside inference.
 * **Shut down with EOS, not a kill.** Tearing the pipeline down mid-capture leaves
   Argus latched in an error state. `sender.py` drains on Ctrl-C for this reason, so
-  stop it with SIGINT (`pkill -INT -f sender.py`) and never SIGKILL.
+  stop it with SIGINT (`pkill -INT -f sender.py`) and never SIGKILL. **SIGTERM is
+  handled too, and has to be**: Python's default for it exits without running
+  `finally`, so the pipeline was never drained — and SIGTERM is exactly what
+  `systemctl stop`, `systemctl restart` and the dashboard's Update button all
+  send (`update.py` SIGTERMs the process group before it pulls). Any of those
+  could latch the cameras until a power cycle. `sender.py` now turns SIGTERM into
+  the same clean path as Ctrl-C.
 * **`nvvideoconvert` defaults to the VIC on Jetson**, and the VIC cannot do
   NV12 → RGB. The detector branch needs exactly that, so it carries
   `compute-hw=GPU`; without it the branch fails with *"RGB/BGR Format

@@ -28,6 +28,13 @@ venv/
 # Build and run logs
 *.log
 
+# Captures written by test/test_lidar.py. Regenerated on every run.
+lidar_c1_data_*.csv
+
+# Overlay stills from test/test_lidar_overlay.py, shot to check rig.json against
+# a real frame. Specific to one scene at one moment; reshoot rather than track.
+lidar_overlay_cam*.jpg
+
 # Colour matrix refitted for local lighting; the default lives in receiver.py
 ccm.json
 

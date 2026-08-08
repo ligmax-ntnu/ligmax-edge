@@ -1,0 +1,81 @@
+{
+  "notes": [
+    "Where the lidar and the two cameras sit relative to each other. HAND-MEASURED,",
+    "not fitted -- these are the numbers to edit when something is re-bolted, and",
+    "test/test_lidar_overlay.py is how you check them against a real image.",
+    "",
+    "FRAME. Everything is expressed in the RIG frame, which uses the same axis",
+    "convention as the camera frame already on the wire (see protocol.py ray_cam):",
+    "    +x starboard (right)   +y DOWN   +z forward",
+    "Note +y is DOWN, so a camera mounted above the lidar has a NEGATIVE y.",
+    "By default the rig frame is the lidar's own frame (the lidar pose below is all",
+    "zeros), because the mounting was measured from the lidar's centre. Give the",
+    "lidar a pose if you later define a boat datum somewhere else -- everything",
+    "downstream goes through the same transform either way.",
+    "",
+    "POSE. Each entry is the pose of that body IN the rig frame:",
+    "    p_rig = R(yaw,pitch,roll) @ p_body + xyz_m",
+    "Angles in degrees, applied yaw*pitch*roll (roll first):",
+    "    yaw   about +y (down)     positive swings to STARBOARD",
+    "    pitch about +x (right)    positive is NOSE UP",
+    "    roll  about +z (forward)  positive puts STARBOARD DOWN",
+    "",
+    "DEFAULTS. Cameras about horizontal, 15 deg either side of forward (30 deg",
+    "between them), each about 5 cm from the lidar centre along its own pointing",
+    "direction and about 5 cm above the scan plane -- the height is what stops the",
+    "camera body blocking the lidar. cam0 and cam1 are written out in full rather",
+    "than mirrored so each can absorb its own mounting error independently.",
+    "",
+    "The cameras are inverted and the pipeline rotates 180 deg before anything else",
+    "sees the frame, so the calibration, the images and these poses are all in the",
+    "same upright frame. There is no extra flip to apply here.",
+    "",
+    "SANITY. The lidar plane sits 5 cm below the lens, so returns land slightly",
+    "below the horizon row and converge onto it with range: at 0.5 m a return is",
+    "about 50 net px below the axis, at 3 m about 6, at 12 m under 2. If your",
+    "overlay shows the opposite trend, y has the wrong sign."
+  ],
+
+  "lidar": {
+    "_yaw": [
+      "The unit is bolted on rotated about 45 deg to the LEFT (to port), so its own",
+      "0 mark points 45 deg to port of the boat's forward. -45 here turns the scan",
+      "back onto the rig's axes, which is what makes a return dead ahead of the boat",
+      "come out at rig bearing 0 and line up with the cameras.",
+      "Check the sign before trusting it: with this right, an object straight ahead",
+      "reads near 0 deg in the overlay tool and near the top of the receiver's",
+      "top-down plot. If everything sits 90 deg out, the sign is flipped."
+    ],
+    "yaw_deg": -45.0,
+    "pitch_deg": 0.0,
+    "roll_deg": 0.0,
+    "xyz_m": [0.0, 0.0, 0.0],
+    "angle_dir": 1,
+    "angle_zero_deg": 0.0,
+    "_angle": [
+      "How the C1's reported heading becomes a direction in the rig frame:",
+      "    a = angle_dir * (reported_deg - angle_zero_deg)",
+      "    p_lidar = (d*sin(a), 0, d*cos(a))",
+      "so a = 0 is forward (+z) and a grows toward starboard (+x).",
+      "angle_dir is +1 for the C1's clockwise-from-above convention and -1 if your",
+      "unit or mounting runs the other way; angle_zero_deg rotates the sensor's own",
+      "0 mark onto the rig's forward. VERIFY BOTH with the overlay tool rather than",
+      "trusting them -- a sign error here looks like a plausible but mirrored world,",
+      "which is the failure most likely to survive a casual glance."
+    ]
+  },
+
+  "cam0": {
+    "yaw_deg": 15.0,
+    "pitch_deg": 0.0,
+    "roll_deg": 0.0,
+    "xyz_m": [0.012941, -0.05, 0.048296]
+  },
+
+  "cam1": {
+    "yaw_deg": -15.0,
+    "pitch_deg": 0.0,
+    "roll_deg": 0.0,
+    "xyz_m": [-0.012941, -0.05, 0.048296]
+  }
+}

@@ -486,6 +486,13 @@ def main():
                     help="do not offer preview frames to the dashboard at all")
     ap.add_argument("--cloud-url", default=None,
                     help="dashboard root; default LIGMAX_UPLOAD_URL or live.ligmax.no")
+    ap.add_argument("--no-cloud-boxes", action="store_true",
+                    help="send the dashboard a clean picture, without the "
+                         "detector's boxes burned into it. The overlay is drawn "
+                         "in the uplink's own thread at the stream's frame rate, "
+                         "so this buys no detector headroom -- it is for judging "
+                         "the camera itself, or the lens, without the detector's "
+                         "opinion drawn on top.")
     ap.add_argument("--mode", type=int, default=0, choices=sorted(SENSOR),
                     help="sensor mode: 0=2592x1944@14 (default, full FOV), "
                          "1=1920x1080@29, 2=1296x972@28. Modes 3 and 4 do not "
@@ -699,10 +706,13 @@ def main():
     # down capture, which Argus does not forgive.
     cloud = None
     if not args.no_cloud:
-        cloud = (CameraUplink(args.cloud_url, os.environ.get("LIGMAX_BOAT_KEY"))
-                 if args.cloud_url else CameraUplink.from_env())
+        boxes = not args.no_cloud_boxes
+        cloud = (CameraUplink(args.cloud_url, os.environ.get("LIGMAX_BOAT_KEY"),
+                              draw_boxes=boxes)
+                 if args.cloud_url else CameraUplink.from_env(draw_boxes=boxes))
         print(f"dashboard uplink -> {cloud.scheme}://{cloud.host}:{cloud.port}"
-              f" (off until an operator asks for it)")
+              f" ({'boxes burned in' if cloud.draw_boxes else 'clean picture'}, "
+              f"off until an operator asks for it)")
 
     if pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
         print("failed to start pipeline", file=sys.stderr)
@@ -938,8 +948,16 @@ def main():
                 # re-encodes on its own thread, and returns immediately when video
                 # is off, so this costs nothing in the common case. The picture
                 # goes straight to shore; the detections above go to the Pi.
+                #
+                # `dets` goes with it only so the boxes can be BURNED IN. The
+                # dashboard has no channel for detections beside the JPEG - they
+                # went to the Pi - so an overlay drawn on shore is not an option
+                # the way it is for receiver.py. Passing the list is two references
+                # and no work: cloud_camera converts it after its own rate gate,
+                # and draws in its worker thread.
                 if cloud is not None:
-                    cloud.submit(i, jpeg, pw, ph, t_cap)
+                    cloud.submit(i, jpeg, pw, ph, t_cap,
+                                 dets=items, det_size=(net_w, net_h))
 
             # The sweep goes as its own message rather than riding on a camera
             # frame: it belongs to neither camera (most of a rotation is behind

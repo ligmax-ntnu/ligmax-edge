@@ -6,6 +6,17 @@ JPEG streamed to a viewer on the network.
 Clean split from the benchmarking work in `../yolo-test`; nothing here depends on
 that directory.
 
+## The other repos on this board
+
+Checked out beside this one, because half the questions here are answered on the
+other side of a wire and guessing at the far end wastes an afternoon:
+
+| path | what it is |
+| --- | --- |
+| `../ligmax-server` | the dashboard at `live.ligmax.no`. `git clone https://github.com/andreasviner/ligmax-server.git` if it is missing. `ligmax_gui/camera.py` is the frame relay this repo's `cloud_camera.py` talks to, `ligmax_gui/server.py` holds the routes and the auth, `web/js/camera.js` is the panel. |
+| `../camera-test` | where the dual-OV5647 capture was first got working — `capture_both.py`, `crop_planner.py`, `live_server.py`. The Bayer-phase finding behind `flip-method=2` (rather than the sensor's flip registers) is from here. |
+| `../yolo-test` | engine builds, precision sweeps and `RESULTS.md`. Nothing here imports it. |
+
 ## Run it
 
 On the Jetson:
@@ -110,6 +121,115 @@ The full-resolution frame is kept as its own pipeline branch, so any detection c
 be measured at native resolution: multiply box coordinates by `crop_w / net_w` and
 add the crop origin. The header carries `crop`, `full_w` and `full_h` for exactly
 this.
+
+## The camera stream to the dashboard
+
+Three things consume the cameras and they all hang off **one crop**, which is the
+property that makes the operator's picture trustworthy: the detector branch, the
+preview/stream branch and the lidar colouring all read the same 2048×1024 window
+out of the same `tee`. Only the scale differs.
+
+```
+nvarguscamerasrc 2592x1944  ! rotate 180  ! tee a{sid}
+    a. ! full frame, NV12, system memory  -> estimate.py       (range refinement)
+    a. ! src-crop 2048x1024 -> 1280x640   -> tee t{sid}
+           t. ! RGB          1280x640     -> YOLO26m + classifier
+           t. ! nvjpegenc     640x320     -> Pi viewer, and cloud_camera.py
+                                              -> re-encoded 480x240 -> live.ligmax.no
+```
+
+2048×1024, 1280×640, 640×320 and 480×240 are all exactly 2:1 and all the same
+window, so **what shore sees is the detector's field of view, pixel for pixel, at
+a quarter of the linear resolution**. There is no second capture path and no
+second crop to drift out of sync — changing `--crop-w`, `--aim-deg` or
+`--crop-top` moves the detector and the stream together by construction. The
+downscale in `cloud_camera._encode` derives the height from the width, so the
+server's `max_width` slider cannot break the aspect either.
+
+### Boxes are burned into the frame, and only here
+
+`receiver.py` gets the detections as JSON alongside the JPEG and draws its own
+overlay. The dashboard cannot: the detections went to the Pi and reach the
+operator as objects on the *map*, so the only thing arriving at `/api/camera` is
+pixels. A clean picture there would show what the lens sees and never what the
+detector sees — and the interesting case is exactly when those two disagree.
+
+So `cloud_camera.py` draws them in, using the same class colours as
+[receiver.py](receiver.py) so a buoy is not green on one screen and yellow on the
+other. The label is just the confidence, plus the cardinal direction when there is
+one: the box colour already says green/red/cardinal, and *which* cardinal is the
+one thing colour cannot encode. At 480 px a longer label covers the buoy it
+describes.
+
+None of it touches the frame budget:
+
+* Coordinates are handed over as two references. They are converted to fractions
+  **after** the uplink's rate gate, so a frame about to be dropped costs nothing.
+* Fractions, not pixels, because `max_width` is a slider on the dashboard and can
+  change between the submit and the encode.
+* The drawing happens in the uplink's worker thread, at the *stream's* 2 fps
+  rather than the detector's 12 — measured **+3.6 ms per frame** on top of the
+  6.0 ms the downscale already cost, so about 1 % of one core across both cameras,
+  and none of it on the capture loop.
+* Drawn **after** the downscale. The other order thins a 2 px outline to under a
+  pixel and resamples the labels into mush.
+
+`--no-cloud-boxes` sends a clean picture. It buys no detector headroom — it is for
+judging the lens without the detector's opinion drawn over it.
+
+### Two things had to be wrong at once, and both were
+
+This link broke in a way worth writing down, because each half on its own looks
+exactly like the other and neither shows up as an error anywhere.
+
+**1. No `User-Agent`.** Cloudflare fronts `live.ligmax.no` and 403s (error 1010)
+anything that looks like a stock library client. `http.client` sends no
+`User-Agent` at all unless told to. The frame POST set one; the config GET did
+not — so the poll was refused at the edge, before Flask ever saw it, `enabled`
+never went true, and therefore no frame was ever offered in the first place. The
+dashboard's own diagnosis for this is *"the Jetson has never asked for the
+config"*, which reads as a dead board. `_headers()` now builds one set of headers
+for every request here, which is the point of it existing at all — the same trap
+already caught `update.py` once.
+
+**2. `/etc/ligmax/node.env` had only `LIGMAX_NODE_KEY`.** The two keys are not
+interchangeable:
+
+* `LIGMAX_NODE_KEY` → `update.py`, the deploy/pull endpoints.
+* `LIGMAX_BOAT_KEY` → `cloud_camera.py`, the frames.
+
+The server takes *either* key on `GET /api/camera/config` but **only the boat
+key** on `POST /api/camera` (`ligmax-server/ligmax_gui/server.py`). So a board
+carrying just the node key updates itself perfectly, reports healthy, and cannot
+push a single frame — and with no boat key at all the config poll 403s too.
+
+Both are fixed, and the stats line now tells them apart instead of saying a bare
+`cloud=off`:
+
+```
+cloud=UNREACHABLE(...)   the poll is not being answered  -> UA, key, or network
+cloud=off                the poll IS answered, the answer is no -> nobody has
+                         switched video on in the dashboard yet
+cloud=998sent/480px q55 2.0fps                           -> streaming
+```
+
+Check it end to end from the Jetson. Note the `-H` — curl sends its own agent, so
+a bare `curl` will succeed where the daemon fails, which is exactly how the first
+half of this hid for so long:
+
+```bash
+KEY=$(sudo sed -n 's/^LIGMAX_BOAT_KEY=//p' /etc/ligmax/node.env)
+curl -s -H "Authorization: Bearer $KEY" https://live.ligmax.no/api/camera/config
+# {"cameras":["0","1"],"enabled":false,"fps":2.0,"jpeg_quality":55,"max_width":480,...}
+```
+
+`403 {"error":"boat key required"}` is Flask, so the key is wrong or missing. A
+403 with Cloudflare's HTML body instead is the agent. A `200` with
+`"enabled":false` is the normal resting state — video is off by default because
+it shares the 4G uplink with telemetry and the E-stop ack, and an operator has to
+switch it on from the dashboard's camera panel. The server counts refused polls
+(`refused` / `last_refusal` in `GET /api/camera/state`), which is the far end of
+the same signal.
 
 ## Bearing, range and capture time
 
@@ -446,5 +566,13 @@ on and is worth an experiment rather than an assumption.
   `stale_full=` in the stats line is there to prove it stays at 0.
 * **`--crop-w 2592` is not a valid option** even though the sensor is that wide: the
   edges fall outside the calibration's 88° cone, so detections there have no bearing.
+* **Every request to `live.ligmax.no` needs a `User-Agent`.** Cloudflare 403s
+  (error 1010) anything without one, and `http.client` sends none by default. A
+  bare `curl` will not reproduce it, because curl sends its own. Bit both
+  `cloud_camera.py` and `update.py`.
+* **`node.env` needs the boat key too.** `LIGMAX_NODE_KEY` alone gets you a board
+  that updates itself, reports healthy and can never send a picture, because the
+  server takes either key on the config poll and only the boat key on the frame
+  POST. See "The camera stream to the dashboard".
 * **Recovering a wedged camera stack:** power-cycle. Restarting `nvargus-daemon`
   and reloading `nv_ov5647` were both tried and neither works.

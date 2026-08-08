@@ -39,11 +39,19 @@ Design rules, because this runs in the capture loop's process:
   * While the stream is off, `submit()` is a couple of comparisons. It stays
     wired in at all times so switching video on needs no restart of the detector.
 
+The boxes are burned into the picture here, unlike everywhere else. `receiver.py`
+gets the detections as JSON beside the frame and draws them itself; the dashboard
+gets a JPEG and nothing else, because the detections took the other route entirely
+and reach the operator as objects on the map. So a panel with no overlay is a panel
+that cannot show what the detector is seeing, only what the lens is - and the two
+disagreeing is exactly the case worth looking at. `--no-cloud-boxes` turns it off.
+
 Usage, from sender.py:
 
     uplink = CameraUplink.from_env()          # or CameraUplink(url, key)
     ...
-    uplink.submit(cam_index, jpeg_bytes, width, height, t_capture)
+    uplink.submit(cam_index, jpeg_bytes, width, height, t_capture,
+                  dets=items, det_size=(net_w, net_h))
     ...
     uplink.close()
 """
@@ -82,10 +90,18 @@ IDLE_TICK = 0.25
 MAX_WIDTH = 1280
 MAX_FPS = 10.0
 
+# Deliberately the same values as receiver.py's COLOURS, keyed by detector class.
+# The bench viewer and the dashboard show the same scene, and a buoy that is green
+# on one screen and yellow on the other costs more confusion than the duplication
+# costs here. Not imported from receiver.py: that module is what runs on the
+# *viewer* host and importing it would drag its HTTP server onto the Jetson.
+BOX_COLOURS = {0: (60, 220, 90), 1: (240, 70, 70), 2: (250, 200, 40)}
+BOX_FALLBACK = (200, 200, 200)
+
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw
 except ImportError:  # the viewer host may have it and the Jetson may not
-    Image = None
+    Image = ImageDraw = None
 
 
 class CameraUplink:
@@ -95,7 +111,7 @@ class CameraUplink:
     """
 
     def __init__(self, target: str = DEFAULT_URL, key: str | None = None,
-                 verify_tls: bool = True) -> None:
+                 verify_tls: bool = True, draw_boxes: bool = True) -> None:
         parsed = urllib.parse.urlparse(
             target if "://" in target else f"https://{target}")
         self.scheme = (parsed.scheme or "https").lower()
@@ -104,6 +120,12 @@ class CameraUplink:
         self.base_path = parsed.path.rstrip("/")
         self.key = (key or "").strip() or None
         self.verify_tls = verify_tls
+        # Burn the detector's boxes into the frame. The dashboard gets a picture
+        # and nothing else - the detections themselves go to the Pi and reach the
+        # operator as map objects - so without this the one thing the panel cannot
+        # show is what the detector is actually seeing. Drawn in the worker thread,
+        # after the downscale, at 2 fps: see `_overlay`.
+        self.draw_boxes = draw_boxes and ImageDraw is not None
 
         # What the dashboard has asked for. Assume off until it says otherwise -
         # the expensive default is never the one we start with.
@@ -161,11 +183,17 @@ class CameraUplink:
         return bool(self.stream.get("enabled"))
 
     def submit(self, cam, jpeg: bytes, width: int, height: int,
-               t_capture: float | None = None) -> None:
-        """Offer a preview JPEG. Never blocks, never raises.
+               t_capture: float | None = None, dets=None, det_size=None) -> None:
+        """Offer a preview JPEG, and the boxes to burn into it. Never blocks.
 
         Cheap to call while the stream is off, which is why it can sit
         unconditionally in the capture loop.
+
+        `dets` is `per_cam[i]` straight out of the detector and `det_size` is
+        `(net_w, net_h)`, the space its `box` coordinates live in. They are turned
+        into fractions of the frame here and drawn in the worker thread - see
+        `_overlay`. Nothing is copied or converted until after the rate gate below,
+        so a frame that is about to be dropped costs nothing extra.
         """
         if self._closed or not jpeg:
             return
@@ -186,14 +214,52 @@ class CameraUplink:
             return
         self._next_send[camera] = now + interval
 
+        # Past the gate, so this runs at the stream's rate (2 fps) rather than the
+        # detector's, and on a handful of detections. Done here rather than in the
+        # worker because `dets` belongs to the caller's frame: it is rebuilt every
+        # iteration, and holding a reference across the queue would mean reading it
+        # while the next frame is being built.
+        boxes = self._normalise(dets, det_size) if self.draw_boxes else ()
+
         with self._lock:
             if camera in self._pending:
                 # Superseded before it went out. Counted, because a high drop rate
                 # against a low fps means the uplink cannot keep up and the
                 # operator should ask for less.
                 self.dropped += 1
-            self._pending[camera] = (jpeg, width, height, t_capture or time.time())
+            self._pending[camera] = (jpeg, width, height,
+                                     t_capture or time.time(), boxes)
         self._wake.set()
+
+    @staticmethod
+    def _normalise(dets, det_size) -> tuple:
+        """Detections -> `(x1, y1, x2, y2, colour, label)` in 0..1 fractions.
+
+        Fractions, not pixels, because the server owns the output size: `max_width`
+        is a slider on the dashboard and can change between this call and the
+        encode. A fraction survives that; a pixel coordinate would silently scale
+        the boxes off the buoys the first time somebody moved it.
+        """
+        if not dets or not det_size:
+            return ()
+        net_w, net_h = det_size
+        if not net_w or not net_h:
+            return ()
+        out = []
+        for det in dets:
+            box = det.get("box") or ()
+            if len(box) != 4:
+                continue
+            colour = BOX_COLOURS.get(det.get("cls"), BOX_FALLBACK)
+            # The box colour already says green/red/cardinal, so the name would be
+            # redundant on a 480 px tile. What it cannot say is *which* cardinal,
+            # and that is the one thing an operator has to read off the picture.
+            label = f"{det.get('conf', 0.0):.2f}"
+            if det.get("card"):
+                label = f"{det['card']} {label}"
+            out.append((box[0] / net_w, box[1] / net_h,
+                        box[2] / net_w, box[3] / net_h, colour, label))
+        return tuple(out)
 
     def stats(self) -> dict:
         """One line for sender.py's periodic stats print."""
@@ -247,8 +313,8 @@ class CameraUplink:
             if not pending:
                 self._wake.wait(IDLE_TICK)
 
-    def _encode(self, jpeg: bytes, width: int, height: int):
-        """Downscale and re-encode to what the server asked for.
+    def _encode(self, jpeg: bytes, width: int, height: int, boxes=()):
+        """Downscale, draw the boxes, and re-encode to what the server asked for.
 
         The Jetson's preview branch already produced a JPEG on the hardware
         encoder, but at the pipeline's own size and quality (`--preview`,
@@ -272,25 +338,69 @@ class CameraUplink:
                       "dashboard asks for", flush=True)
             return jpeg, width, height
 
-        if width and width <= target:
-            # Already small enough. Re-encoding it would only lose quality.
+        if width and width <= target and not boxes:
+            # Already small enough, and nothing to draw on it. Re-encoding it
+            # would only lose quality. With boxes there is no such shortcut - they
+            # have to be burned in, so the decode happens either way.
             return jpeg, width, height
 
         try:
             image = Image.open(io.BytesIO(jpeg))
             image.load()
-            scale = target / float(image.width)
-            size = (target, max(1, int(round(image.height * scale))))
-            # BILINEAR, not LANCZOS: this is a 480 px preview on a phone-sized
-            # panel and the sharper filter costs more than it shows.
-            small = image.resize(size, Image.BILINEAR)
+            if image.width > target:
+                scale = target / float(image.width)
+                size = (target, max(1, int(round(image.height * scale))))
+                # BILINEAR, not LANCZOS: this is a 480 px preview on a phone-sized
+                # panel and the sharper filter costs more than it shows.
+                image = image.resize(size, Image.BILINEAR)
+            if boxes:
+                # After the resize, never before: drawing at 640x320 and then
+                # scaling down would thin the 2 px outlines to something under a
+                # pixel and resample the labels into mush. This way every stroke is
+                # laid down at the size it will be viewed at, and the drawing cost
+                # is set by the output tile rather than the source frame.
+                image = self._overlay(image, boxes)
             out = io.BytesIO()
-            small.save(out, format="JPEG", quality=quality, optimize=False)
-            return out.getvalue(), size[0], size[1]
+            image.save(out, format="JPEG", quality=quality, optimize=False)
+            return out.getvalue(), image.width, image.height
         except Exception as exc:  # noqa: BLE001 - a bad frame is not fatal
             self.last_error = f"re-encode failed: {exc}"
             self.errors += 1
             return jpeg, width, height
+
+    @staticmethod
+    def _overlay(image, boxes):
+        """Draw the fraction-space boxes onto `image`. Returns the image to encode.
+
+        Costs ~1 ms for a handful of boxes on a 480x240 tile, in the uplink's own
+        worker thread and at the stream's 2 fps - so it is off the capture loop
+        twice over and cannot show up in the frame budget. That placement is the
+        whole reason this is drawn here and not where the detections are produced.
+
+        A JPEG decodes to a mode the draw may not accept (grayscale, or CMYK from a
+        stray file), so convert rather than assume.
+        """
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        w, h = image.width, image.height
+        # 2 px at the 480 px default, 1 px if an operator asks for something tiny.
+        # A hairline outline disappears against a choppy sea.
+        width = max(1, int(round(w / 320.0)))
+        draw = ImageDraw.Draw(image)
+        for x1, y1, x2, y2, colour, label in boxes:
+            px1, py1 = x1 * w, y1 * h
+            px2, py2 = x2 * w, y2 * h
+            draw.rectangle([px1, py1, px2, py2], outline=colour, width=width)
+            if not label:
+                continue
+            tw = draw.textlength(label)
+            # Above the box, unless the box is against the top edge - a label drawn
+            # off-frame is worse than one inside it.
+            ty = py1 - 11 if py1 >= 11 else min(py2, h - 11)
+            tx = min(px1, max(0.0, w - tw - 4))
+            draw.rectangle([tx, ty, tx + tw + 4, ty + 11], fill=colour)
+            draw.text((tx + 2, ty), label, fill=(0, 0, 0))
+        return image
 
     def _headers(self, **extra: str) -> dict:
         """Headers every request here must carry.
@@ -314,8 +424,8 @@ class CameraUplink:
         return headers
 
     def _post(self, camera: str, jpeg: bytes, width: int, height: int,
-              t_capture: float) -> None:
-        payload, out_w, out_h = self._encode(jpeg, width, height)
+              t_capture: float, boxes=()) -> None:
+        payload, out_w, out_h = self._encode(jpeg, width, height, boxes)
         query = urllib.parse.urlencode({
             "cam": camera,
             "t": f"{t_capture:.3f}",

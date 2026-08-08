@@ -435,8 +435,16 @@ def _cloud_line(cloud):
 
     Deliberately says `off` rather than nothing when the operator has not asked for
     video, so the log distinguishes "nobody wants it" from "it is broken".
+
+    `off` and `UNREACHABLE` are the two halves of that: the first means the poll
+    is being answered and the answer is no, the second means the dashboard has
+    never answered one at all, which is what a missing LIGMAX_BOAT_KEY or a
+    Cloudflare 1010 looks like from here. They are indistinguishable on the
+    dashboard, so this line is where you tell them apart.
     """
     stats = cloud.stats()
+    if not stats["config_ok"]:
+        return f"UNREACHABLE({stats['last_error'] or 'connecting'})"
     if not stats["enabled"]:
         return "off"
     parts = [f"{stats['sent']}sent"]
@@ -601,6 +609,29 @@ def main():
                   f"sensor is {[w, h]}; a model does not transfer across modes. "
                   f"Estimation disabled for this camera.", file=sys.stderr)
             model = None
+        # A calibration is only valid for the image ORIENTATION it was captured in.
+        # Get this wrong and nothing fails: the fit is still good, the projection
+        # still lands inside the frame, and every lidar return is simply coloured
+        # from the pixel 180 deg opposite the one it should read -- a green light
+        # off the starboard bow tints returns off the port quarter. There is no
+        # geometric check that catches it, which is why it is asserted here.
+        rotated = model.get("rotated_180") if model is not None else None
+        if model is not None:
+            if rotated is None:
+                print(f"[warn] cam{sid} calibration does not record whether it was "
+                      f"captured with the 180 deg rotation on; it predates that "
+                      f"field. This run has rotation "
+                      f"{'ON' if not args.no_rotate else 'OFF'} -- if colour lands "
+                      f"opposite where it belongs, that mismatch is the reason "
+                      f"(try --no-rotate). Recalibrate to record it.",
+                      file=sys.stderr)
+            elif bool(rotated) != (not args.no_rotate):
+                print(f"[warn] cam{sid} calibration was captured with rotation "
+                      f"{'ON' if rotated else 'OFF'} but this run has it "
+                      f"{'ON' if not args.no_rotate else 'OFF'}. Colour and bearing "
+                      f"will be 180 deg out. Pass "
+                      f"{'--no-rotate' if rotated is False else 'no --no-rotate'} "
+                      f"or recalibrate.", file=sys.stderr)
         # cam0 swings toward its right, cam1 toward its left: that is where the pair
         # overlaps, verified by matching the same scene features in both frames.
         aim = args.aim_deg if sid == 0 else -args.aim_deg

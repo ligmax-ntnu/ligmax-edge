@@ -789,6 +789,10 @@ def calibrate(args) -> int:
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump({"model": "kannala_brandt", "image_size": list(size),
                    "K": K.tolist(), "D": D.reshape(-1).tolist(),
+                   # Which image orientation this model is valid for. sender.py
+                   # cross-checks it against its own --no-rotate; a mismatch has
+                   # no geometric symptom, only 180-deg-wrong colour and bearing.
+                   "rotated_180": not args.captured_no_rotate,
                    "theta_max_deg": rep["theta_max_deg"],
                    "r_valid_px": r_max, "valid_frac": rep["valid_frac"],
                    "rms_px": float(rms), "n_views": len(obj_pts),
@@ -947,6 +951,14 @@ def main() -> int:
     ap.add_argument("--dpi", type=int, default=300)
     ap.add_argument("--images", help="folder of calibration stills")
     ap.add_argument("--out", default="calib.json")
+    ap.add_argument("--captured-no-rotate", action="store_true",
+                    help="the stills were captured with calib_server.py's "
+                         "--no-rotate, i.e. NOT rotated 180. Recorded into the "
+                         "model as rotated_180 so sender.py can refuse to pair a "
+                         "calibration with a run in the opposite orientation. "
+                         "Getting this wrong is silent: the fit stays good and "
+                         "every lidar return is simply coloured from the pixel "
+                         "180 deg opposite the right one.")
     ap.add_argument("--nx", type=int, default=4, help="markers across")
     ap.add_argument("--ny", type=int, default=5, help="markers down")
     ap.add_argument("--marker", type=float, default=0.035,

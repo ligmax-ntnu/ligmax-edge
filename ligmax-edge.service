@@ -11,9 +11,22 @@
 #   sudo tee /etc/ligmax/node.env >/dev/null <<'EOF'
 #   LIGMAX_DEPLOY_URL=https://live.ligmax.no
 #   LIGMAX_NODE_KEY=<LIGMAX_NODE_KEY from ligmax-server/.env>
-#   HOST=192.168.99.135
-#   PORT=3338
+#   LIGMAX_BOAT_KEY=<this boat's ingest key from ligmax-server/.env>
 #   EOF
+#
+# LIGMAX_BOAT_KEY is what cloud_camera.py authenticates the dashboard uplink
+# with, and without it BOTH `GET /api/camera/config` and `POST /api/camera` are
+# refused: video never switches on, no frame is ever sent, and the panel reports
+# "the Jetson has never asked for the config" -- which reads as a dead board.
+# It is the same key the Pi uses (ligmax-pi.service), because it is the same
+# trust boundary.
+#
+# HOST and PORT are deliberately NOT set here. run.sh already defaults them to
+# ligmax-pi3.local:3401, which is where the Pi binds; setting them overrides that
+# default, and the pair this file used to carry (192.168.99.135:3338) was a bench
+# laptop on the port the dashboard owns. Set them only for bench work against a
+# receiver.py, and per-run rather than in this file:
+#   HOST=192.168.1.50 PORT=3401 ./run.sh
 #   sudo chmod 640 /etc/ligmax/node.env
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now ligmax-edge

@@ -61,6 +61,11 @@ import urllib.parse
 
 DEFAULT_URL = "https://live.ligmax.no"
 
+# Sent on EVERY request, not just the frame POST. Cloudflare fronts the
+# dashboard and refuses anything that looks like a stock library client - see
+# `_headers()` and the same note in `update.py`.
+UA = "ligmax-edge/cloud_camera"
+
 # How often to ask the dashboard what it wants, while nothing is being sent. The
 # reply to every frame POST also carries the config, so once video is running this
 # poll is only a keepalive that tells the panel the Jetson is listening at all.
@@ -123,6 +128,7 @@ class CameraUplink:
         self._connection = None
         self._next_send: dict[str, float] = {}
         self._last_poll = 0.0
+        self._last_config_status: int | None = None
         self._warned_no_pil = False
 
         self._thread = threading.Thread(
@@ -193,6 +199,10 @@ class CameraUplink:
         """One line for sender.py's periodic stats print."""
         return {
             "enabled": self.enabled,
+            # Has the dashboard ever answered a config poll? "Off" with this
+            # False means we are being refused, not that nobody wants video -
+            # the one distinction worth having in the journal.
+            "config_ok": self.last_config_at > 0.0,
             "sent": self.sent,
             "dropped": self.dropped,
             "errors": self.errors,
@@ -282,6 +292,27 @@ class CameraUplink:
             self.errors += 1
             return jpeg, width, height
 
+    def _headers(self, **extra: str) -> dict:
+        """Headers every request here must carry.
+
+        The User-Agent is not decoration. Cloudflare fronts live.ligmax.no and
+        403s requests with a default-looking or absent agent (error 1010) - the
+        same trap that left `update.py` reading "Never polled" on the dashboard
+        while it had been polling all along, and `http.client` sends no
+        User-Agent at all unless told to. This used to be set on the frame POST
+        only, so the config GET was refused, `enabled` never went true, and no
+        frame was ever offered: no picture, and the panel blamed the Jetson for
+        not asking.
+        """
+        headers = {
+            "Connection": "keep-alive",
+            "User-Agent": UA,
+            **extra,
+        }
+        if self.key:
+            headers["Authorization"] = f"Bearer {self.key}"
+        return headers
+
     def _post(self, camera: str, jpeg: bytes, width: int, height: int,
               t_capture: float) -> None:
         payload, out_w, out_h = self._encode(jpeg, width, height)
@@ -293,13 +324,7 @@ class CameraUplink:
             "label": f"cam{camera}",
         })
         path = f"{self.base_path}/api/camera?{query}"
-        headers = {
-            "Content-Type": "image/jpeg",
-            "Connection": "keep-alive",
-            "User-Agent": "ligmax-edge/cloud_camera",
-        }
-        if self.key:
-            headers["Authorization"] = f"Bearer {self.key}"
+        headers = self._headers(**{"Content-Type": "image/jpeg"})
 
         # Two attempts: a kept-alive socket the far end has since closed fails on
         # the write, and that failure says nothing about the next try.
@@ -338,12 +363,10 @@ class CameraUplink:
         connection = self._get_connection()
         if connection is None:
             return
-        headers = {"Connection": "keep-alive"}
-        if self.key:
-            headers["Authorization"] = f"Bearer {self.key}"
         try:
             connection.request(
-                "GET", f"{self.base_path}/api/camera/config", headers=headers)
+                "GET", f"{self.base_path}/api/camera/config",
+                headers=self._headers())
             response = connection.getresponse()
             body = response.read()
         except (http.client.HTTPException, OSError, ssl.SSLError) as exc:
@@ -353,7 +376,21 @@ class CameraUplink:
         if response.status == 200:
             self._absorb(body)
         else:
+            # Say which refusal it is. 401/403 here is the poll being turned
+            # away - almost always no LIGMAX_BOAT_KEY in /etc/ligmax/node.env,
+            # or Cloudflare - and from the dashboard it looks identical to a
+            # Jetson that is not running at all, so the log is the only place
+            # the difference shows.
+            self.errors += 1
             self.last_error = f"config HTTP {response.status}"
+            if response.status in (401, 403):
+                self.last_error += (
+                    " - the dashboard refused the config poll; check "
+                    "LIGMAX_BOAT_KEY is set on this board"
+                )
+            if response.status != self._last_config_status:
+                print(f"cloud_camera: {self.last_error}", flush=True)
+        self._last_config_status = response.status
 
     def _absorb(self, body: bytes) -> None:
         """Take the config out of a reply. Every reply carries it."""

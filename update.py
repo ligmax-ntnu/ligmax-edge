@@ -24,6 +24,10 @@ DASH = os.environ.get("LIGMAX_DEPLOY_URL", "https://live.ligmax.no").rstrip("/")
 KEY = os.environ.get("LIGMAX_NODE_KEY", "")
 POLL = 30  # seconds between /pending checks
 TICK = 1  # how often we look at the child, so a restart is not a poll behind
+UA = "ligmax-edge/updater"  # deliberately not urllib's default; see ask()
+QUIET = 120  # failed polls between journal lines, i.e. one an hour at POLL=30
+
+poll_fails = 0  # consecutive failed polls, for the throttling in poll_if_due
 
 # Wall-clock, and shared across every child this process ever starts -- NOT
 # reset each time a new one is spawned. run.sh's own preflight can fail in

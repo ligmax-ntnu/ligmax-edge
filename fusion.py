@@ -40,11 +40,38 @@ Time, which is the part that is easy to get wrong
 A sweep is not an instant. It takes ~100 ms -- longer than the camera's 71.4 ms
 frame -- so a return at the back of a rotation is more than a whole frame older
 than one at the front. And the camera frame the sweep is coloured against was
-captured ~250 ms before it reaches this code. Both are handled explicitly: `lidar.LidarReader.sweep_near` selects by
-the frame's `t_capture` out of a buffer, and the achieved skew rides on the wire
-as `skew_ms`. Past `max_skew` the points still ship -- a lidar return is valid
-whatever the cameras were doing -- but they ship UNCOLOURED, because a colour
-sampled from a frame that does not line up is worse than no colour at all.
+captured ~250 ms before it reaches this code. Both are handled explicitly:
+`lidar.LidarReader.sweep_near` selects by the frame's `t_capture` out of a
+buffer, and the achieved skew rides on the wire as `skew_ms`.
+
+That still leaves ONE frame trying to colour a whole rotation, which it cannot
+do. An instant is never close in time to all of a 100 ms sweep: with a +-40 ms
+gate the arithmetic caps colouring at 80 % of a rotation, and drops to ~45 %
+when the sweep midpoint drifts away from the frame. Measured on this rig it sat
+at a median of 46 %, breathing between 13 % and 68 % as the 10 Hz scanner beat
+against ~10 fps cameras -- which is what a viewer sees as the colour pulsing.
+
+So each return picks its OWN frame. `View.history` carries the last few frames
+per camera, and every point is coloured from whichever one was exposed nearest
+to the moment that point was measured. That pulls the typical per-point age well
+inside the gate and colours essentially every return a lens covers, for the cost
+of holding two or three frames per camera and no extra arithmetic.
+
+Past `max_skew` a point is coloured anyway, from the closest frame there is,
+because a slightly mistimed colour is more use than none. But it is coloured
+HONESTLY: `age_ms` carries each point's own frame distance and `stale` counts
+the ones outside the gate, so a consumer can down-weight them rather than being
+unable to tell a fresh colour from an old one. `max_age` is the hard stop, for
+when a camera has stopped producing frames entirely and the buffer holds nothing
+worth sampling.
+
+What is left uncoloured after all that is geometry, not timing: the arc outside
+both lenses, ~34 deg aft on this rig. `drop_unseen` (the default) removes those
+returns rather than shipping them, which is what keeps grey dots off a viewer.
+Be clear about what it costs: they are real obstacles the scanner measured, and
+dropping them is a statement that the aft lidar covers that arc. It is not a
+speed measure -- it saves ~1 % of `fuse` and ~10 % of the wire, because the work
+was never in the points no camera could see.
 """
 from __future__ import annotations
 
@@ -78,6 +105,14 @@ FOREGROUND_GATE_M = 0.5
 # distant buoy, where a wide one would average the target with the sea behind it.
 PATCH_X = 2            # +-2 px horizontally -> 5 wide
 PATCH_DY = (0, 3)      # 0..+3 px DOWN from the projected pixel -> 4 tall
+
+# Added to a stale sample's score so that ANY timely bid beats it, whatever the
+# two field angles are: a colour from the right moment through the rim of the
+# lens is better evidence than one from the wrong moment down the axis. Field
+# angle inside the calibrated cone is under pi/2, so 10 rad is comfortably past
+# anything the comparison can otherwise produce -- which makes "prefer timely,
+# then prefer the squarer look" a single array comparison instead of two passes.
+STALE_COST = 10.0
 
 # JetPack ships no ISP colour tuning for the OV5647, so Argus hands back close to
 # sensor-native RGB: every Bayer sensor has heavy spectral crosstalk between its
@@ -174,20 +209,49 @@ class Rig:
 
 
 class View:
-    """One camera's contribution: geometry, the frame to sample, and its boxes.
+    """One camera's contribution: geometry, the frames to sample, and its boxes.
 
     `rgb` is the detector-input frame (net_w x net_h) -- the same pixels the boxes
     are expressed in, already in system memory, so sampling it costs nothing extra
-    and no coordinate mapping can drift between colour and box.
+    and no coordinate mapping can drift between colour and box. It is the frame
+    the DETECTIONS belong to; `t_caps[index]` in `fuse` is when it was captured.
+
+    `history` is the frames before it, newest first, as (rgb, t_capture) pairs --
+    only for colour, never for boxes. A frame is an instant and a rotation is
+    100 ms, so no single frame is close in time to all of a sweep; with a couple
+    of older ones kept, every return can be coloured from whichever frame was
+    exposed nearest to the moment it was measured. Two or three is enough: frames
+    land ~100 ms apart, so three of them cover a whole rotation either side.
+
+    They must be frames this View can keep -- `sender.sample_to_rgb` copies out
+    of the GStreamer buffer before unmapping it, so holding one across frames is
+    safe. Handing over a view onto a recycled buffer would colour the sweep from
+    whatever the pipeline wrote next.
     """
 
-    __slots__ = ("index", "cam", "rgb", "dets")
+    __slots__ = ("index", "cam", "rgb", "dets", "history")
 
-    def __init__(self, index, cam, rgb, dets):
+    def __init__(self, index, cam, rgb, dets, history=()):
         self.index = index
         self.cam = cam
         self.rgb = rgb
         self.dets = dets
+        self.history = tuple(history)
+
+    def frames(self, t_cap):
+        """(rgb, t_capture) newest first, current frame first.
+
+        The current frame's time lives in `fuse`'s `t_caps` rather than on the
+        View, because that is also what the skew report is measured against; this
+        is where the two are put back together.
+
+        A camera with no frame at all this round still contributes whatever is in
+        `history`: a colour from the last picture there was beats none, which is
+        the same argument that lets a point past `max_skew` be coloured. `max_age`
+        is what stops that reaching back indefinitely into a stalled camera.
+        """
+        cur = () if self.rgb is None else ((self.rgb, t_cap),)
+        return cur + self.history
 
 
 def _sample(rgb, u, v):
@@ -270,19 +334,34 @@ def _correct(rgb, strength=1.0):
 
 
 def fuse(sweep, rig, views, max_skew=0.06, t_caps=None,
-         foreground_gate=FOREGROUND_GATE_M, build_cloud=True, ccm_strength=1.0):
+         foreground_gate=FOREGROUND_GATE_M, build_cloud=True, ccm_strength=1.0,
+         max_age=None, drop_unseen=True):
     """Colour a sweep and hang a lidar range off every detection it lands in.
 
     `views` may hold None for a camera that has no calibration or no frame this
     round; those simply do not contribute colour. `t_caps` is each camera's
-    frame capture time, against which every point is timed individually.
+    current frame capture time, against which every point is timed individually.
 
-    The time gate is PER POINT, not per sweep, and that distinction is the whole
-    reason this reads the way it does. A rotation lasts ~100 ms, so its midpoint
-    is up to 50 ms from any given frame no matter how well the two are running --
-    gate on the sweep as a whole and colour switches off permanently while
-    nothing is actually wrong. What decides whether a return can be coloured is
-    when THAT RETURN was measured, which `Sweep.times` already knows.
+    Timing is PER POINT, not per sweep, and that distinction is the whole reason
+    this reads the way it does. A rotation lasts ~100 ms, so its midpoint is up
+    to 50 ms from any given frame no matter how well the two are running -- judge
+    the sweep as a whole and colour degrades permanently while nothing is
+    actually wrong. What matters is when THAT RETURN was measured, which
+    `Sweep.times` already knows, and which frame was exposed nearest to it, which
+    `View.history` is what makes answerable.
+
+    `max_skew` is the quality line, not a switch: inside it a point is timely,
+    outside it the point is still coloured from the closest frame available but
+    is counted in `stale` and carries its own `age_ms`. `max_age` is the hard
+    stop past which no frame is worth sampling -- None for "anything in the
+    buffer", which is the right answer while the buffer is a few frames deep, and
+    a real bound when a camera can stall and leave the buffer stagnant.
+
+    `drop_unseen` discards returns no camera could see instead of shipping them
+    uncoloured. It shortens everything downstream of the projection, and it is
+    what keeps grey dots off a viewer -- but those returns are real obstacles,
+    so it is a statement that something else is watching that arc. `n` is then
+    the number of points in the arrays, and `dropped` how many were removed.
 
     Mutates each detection dict in `views[i].dets`, adding a `lidar` block to the
     ones that got returns. Returns the columnar point cloud that goes on the wire.
@@ -290,34 +369,58 @@ def fuse(sweep, rig, views, max_skew=0.06, t_caps=None,
     p_rig = rig.sweep_to_rig(sweep)
     n = p_rig.shape[0]
     t_pt = sweep.times()
+    quality = sweep.quality
 
     cam_of = np.full(n, -1, dtype=np.int8)
     rgb_of = np.zeros((n, 3), dtype=np.uint8)
     det_of = np.full(n, -1, dtype=np.int32)
-    # Field angle of the winning camera, so the second camera only takes a point
-    # off the first if it sees it further from the rim, where the fisheye is
-    # better behaved and the calibration is better constrained.
-    best_field = np.full(n, np.inf)
+    # Score of the winning bid, so a second camera only takes a point off the
+    # first when it offers a better one: timely beats stale (STALE_COST), and
+    # among equals the squarer look wins, where the fisheye is better behaved
+    # and the calibration is better constrained.
+    best_score = np.full(n, np.inf)
     uv_of = np.zeros((n, 2), dtype=np.float64)
+    # Seconds between each point's own measurement and the frame it was coloured
+    # from, -1 where nothing coloured it. This is what keeps a stale colour
+    # distinguishable from a fresh one now that both go on the wire.
+    age_of = np.full(n, -1.0)
     # Timely for at least one camera. Reported separately from `coloured` so the
     # two reasons a return has no colour stay distinguishable: outside every
     # lens (geometry, expected -- most of a rotation is) versus measured at the
     # wrong moment (timing, worth investigating).
     timely_any = np.zeros(n, dtype=bool)
+    # Never below max_skew: a bound that discarded frames the gate had just
+    # called timely would be gating twice, with the tighter number losing.
+    age_cap = np.inf if max_age is None else max(float(max_age), max_skew)
 
     for view in views:
-        if view is None or view.cam is None or view.rgb is None:
+        if view is None or view.cam is None:
             continue
-        # Timeliness, per point: a return measured while this frame was being
-        # exposed can be coloured from it; one measured most of a rotation later
-        # cannot, and gets no colour rather than a wrong one.
-        if t_caps is None or t_caps[view.index] is None:
-            timely = np.ones(n, dtype=bool)
+        # Which frame colours which return, per point. A frame is an instant and
+        # a rotation is 100 ms, so one frame can never be near all of a sweep --
+        # each return takes the frame exposed closest to the moment it was
+        # measured. The buffer is two or three deep, so this is a tiny (n, k)
+        # argmin, not a search.
+        t_cap = None if t_caps is None else t_caps[view.index]
+        frames = view.frames(t_cap)
+        if not frames:
+            continue                # no current frame and nothing buffered
+        ft = [t for _, t in frames]
+        if any(t is None for t in ft):
+            # Something in the mix is untimed, so there is nothing to choose
+            # between and nothing to call stale: newest wins, which is exactly
+            # what this did before frames were buffered.
+            pick = np.zeros(n, dtype=np.intp)
+            age = np.zeros(n)
         else:
-            timely = np.abs(t_pt - t_caps[view.index]) <= max_skew
-            timely_any |= timely
-            if not timely.any():
-                continue
+            dt = np.abs(t_pt[:, None] - np.array(ft, dtype=np.float64)[None, :])
+            pick = dt.argmin(axis=1)
+            age = dt[np.arange(n), pick]
+            timely_any |= age <= max_skew
+        timely = age <= max_skew
+        usable = age <= age_cap
+        if not usable.any():
+            continue
         p_cam = rig.cams[view.index].from_rig(p_rig)
         # Narrow to what can possibly land on this lens BEFORE projecting. A
         # camera sees one hemisphere and the scanner sweeps the whole circle, so
@@ -326,13 +429,13 @@ def fuse(sweep, rig, views, max_skew=0.06, t_caps=None,
         # polynomial and two more trig calls per point), against a frame budget
         # with ~10 ms of slack. z > 0 is exactly the "in front of the lens" test
         # and costs one comparison.
-        cand = np.flatnonzero(timely & (p_cam[:, 2] > 0.0))
+        cand = np.flatnonzero(usable & (p_cam[:, 2] > 0.0))
         if cand.size == 0:
             continue
         pc = p_cam[cand]
         uv_full, in_cone = view.cam.project(pc)
         uv_net = view.cam.to_net(uv_full)
-        h, w = view.rgb.shape[:2]
+        h, w = frames[0][0].shape[:2]
         ok = (in_cone
               & (uv_net[:, 0] >= 0) & (uv_net[:, 0] <= w - 1)
               & (uv_net[:, 1] >= 0) & (uv_net[:, 1] <= h - 1))
@@ -341,16 +444,56 @@ def fuse(sweep, rig, views, max_skew=0.06, t_caps=None,
         sel, pc, uv_net = cand[ok], pc[ok], uv_net[ok]
         # Off-axis angle, as the tie-break between two cameras that both see it:
         # the one looking at it more squarely wins, where the fisheye is better
-        # behaved and the calibration better constrained.
+        # behaved and the calibration better constrained. Timing outranks it --
+        # a colour from the right moment through the rim beats one from the wrong
+        # moment down the axis -- which STALE_COST folds into the same number.
         field = np.arccos(np.clip(pc[:, 2] / np.linalg.norm(pc, axis=1), -1.0, 1.0))
-        better = field < best_field[sel]
+        score = field + np.where(timely[sel], 0.0, STALE_COST)
+        better = score < best_score[sel]
         if not better.any():
             continue
         take = sel[better]
-        best_field[take] = field[better]
+        best_score[take] = score[better]
         cam_of[take] = view.index
         uv_of[take] = uv_net[better]
-        rgb_of[take] = _sample(view.rgb, uv_net[better, 0], uv_net[better, 1])
+        age_of[take] = age[take]
+        # One gather per SOURCE FRAME rather than per point. The buffer is two or
+        # three deep, so the winners fall into a handful of groups and each is
+        # the single fancy-index `_sample` always did; stacking the frames into
+        # one array to index them together would copy several MB per camera per
+        # frame to save a couple of numpy calls.
+        uvw = uv_net[better]
+        pk = pick[take]
+        for k in np.unique(pk):
+            m = pk == k
+            rgb_of[take[m]] = _sample(frames[k][0], uvw[m, 0], uvw[m, 1])
+
+    # ---- drop what no camera could see
+    #
+    # As early as this can honestly go. Visibility is not knowable before the
+    # projection above -- a lidar bearing does not map to a fixed arc of the
+    # image, because the lens sits ~5 cm off the scan plane and the parallax that
+    # introduces is range-dependent (rig.json's SANITY note: ~50 px at 0.5 m,
+    # ~2 px at 12 m). A bearing-only prefilter would have to carry a margin for
+    # that, and margin on the wrong side silently discards returns that WERE in
+    # frame. So the cheap `z > 0` test already skips projecting points behind a
+    # lens, and everything after this line -- the box tests, the eight columnar
+    # arrays, the JSON, the wire -- runs on the points that survived.
+    #
+    # What this throws away is real: a return with no colour is still a solid
+    # obstacle the scanner measured, and on this rig it is the ~34 deg aft wedge
+    # outside both lenses. It is dropped here on the assumption that the aft
+    # lidar covers behind; --lidar-keep-unseen puts it back.
+    dropped = 0
+    if drop_unseen:
+        keep = cam_of >= 0
+        dropped = int(n - keep.sum())
+        if dropped:
+            p_rig, t_pt, quality = p_rig[keep], t_pt[keep], quality[keep]
+            cam_of, rgb_of, det_of = cam_of[keep], rgb_of[keep], det_of[keep]
+            uv_of, age_of = uv_of[keep], age_of[keep]
+            timely_any = timely_any[keep]
+            n = int(keep.sum())
 
     # ---- detections: which returns fall inside which box
     for view in views:
@@ -408,6 +551,9 @@ def fuse(sweep, rig, views, max_skew=0.06, t_caps=None,
             det_of[hit_fg] = det.get("id") if det.get("id") is not None else -1
 
     coloured = int((cam_of >= 0).sum())
+    # Coloured, but from a frame outside the gate. age_of is -1 where nothing
+    # coloured the point at all, so those cannot land in this count.
+    stale = int((age_of > max_skew).sum())
     if not build_cloud:
         # The detections above already have their ranges, which is the half of
         # this that every frame needs. The point cloud goes on the wire once per
@@ -417,8 +563,13 @@ def fuse(sweep, rig, views, max_skew=0.06, t_caps=None,
     return {
         "seq": int(sweep.seq),
         "frame": "rig",
+        # Points IN THESE ARRAYS, which is what every consumer indexes by. With
+        # drop_unseen it is no longer the size of the rotation -- `n + dropped`
+        # is, and a rate check wants that sum, not this.
         "n": int(n),
+        "dropped": dropped,
         "coloured": coloured,
+        "stale": stale,
         "in_time": int(timely_any.sum()) if t_caps is not None else int(n),
         "t_start": round(float(sweep.t_start), 6),
         "t_end": round(float(sweep.t_end), 6),
@@ -441,7 +592,14 @@ def fuse(sweep, rig, views, max_skew=0.06, t_caps=None,
         "y": np.round(p_rig[:, 1], 3).tolist(),
         "z": np.round(p_rig[:, 2], 3).tolist(),
         "dt_ms": np.round(1000.0 * (t_pt - sweep.t_start), 1).tolist(),
-        "q": sweep.quality.tolist(),
+        # How far the frame each point was coloured from sat from that point's own
+        # measurement. This is the honesty that lets a mistimed colour ship at all:
+        # without it a consumer cannot tell a colour sampled while the return was
+        # measured from one sampled a couple of frames away. -1 where uncoloured,
+        # so it cannot be read as a perfect 0 ms.
+        "age_ms": np.where(age_of < 0.0, -1.0,
+                           np.round(1000.0 * age_of, 1)).tolist(),
+        "q": quality.tolist(),
         "cam": cam_of.tolist(),
         # Colour-corrected here rather than left sensor-native: see `_correct`.
         # `ccm_strength` is what the ISP's own saturation has NOT already done --

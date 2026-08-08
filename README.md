@@ -313,16 +313,47 @@ reaches the fusion code ~250 ms after its photons landed. Both matter:
 * The sweep is chosen **by capture time** out of a two-second buffer, not by
   "the newest one". Newest is ~250 ms ahead of the frame, which at 3 m/s is
   0.75 m of registration error on a sensor whose whole range is 12 m.
-* The colour gate is **per point, not per sweep**. Every return carries its own
-  timestamp (`dt_ms`, interpolated by angle). Gating on the sweep as a whole
-  cannot work: a 100 ms rotation's midpoint is up to 50 ms from any frame no
-  matter how well the two are running, so colour would switch off permanently
-  while nothing was wrong.
+* Timing is **per point, not per sweep**. Every return carries its own timestamp
+  (`dt_ms`, interpolated by angle). Judging the sweep as a whole cannot work: a
+  100 ms rotation's midpoint is up to 50 ms from any frame no matter how well the
+  two are running, so colour would degrade permanently while nothing was wrong.
+* Each point is coloured from **its own nearest frame**. One frame is an instant
+  and a rotation is 100 ms, so no single frame is close to all of a sweep: with a
+  ±40 ms gate the arithmetic caps colouring at 80 % of a rotation and falls to
+  ~45 % as the sweep midpoint drifts. Measured here it sat at a **median 46 %,
+  breathing between 13 % and 68 %** as the 10 Hz scanner beat against ~10 fps
+  cameras — which is what a viewer sees as the colour pulsing. `sender` keeps the
+  last `--lidar-frame-history` frames per camera (default 2, plus the current
+  one) and every return takes whichever was exposed nearest to it. Costs
+  0.3 ms per frame and ~10 MB, and takes colouring to every return a lens covers.
 
-`skew=` on the stats line is the sweep-to-frame capture-time difference, and
-`in_time` on the wire separates the two reasons a return has no colour — measured
-at the wrong moment (timing, investigate) versus outside every lens (geometry,
-expected, since most of a rotation is behind both cameras).
+Past `--lidar-max-skew` a point is coloured **anyway**, from the closest frame
+there is — a slightly mistimed colour beats none — but honestly: `age_ms` carries
+each point's own frame distance and `stale` counts the ones outside the gate, so
+a consumer can down-weight them instead of being unable to tell. Frames land
+~100 ms apart, so worst-case age is now bounded near 50 ms rather than a full
+rotation. `--lidar-max-age` (default 250 ms) is the hard stop for a camera that
+has stalled and left the buffer stagnant; only there do points ship uncoloured.
+
+Returns **no camera could see at all** — the ~34° aft wedge outside both lenses —
+are dropped rather than shipped grey. `n` is then the points in the arrays and
+`dropped` how many were removed, so a returns-per-rev check wants `n + dropped`.
+This is a data decision, not a speed one: it assumes the aft lidar watches that
+arc, and it buys ~10 % of the wire but only ~1 % of `fuse`, since the work was
+never in the points no camera could see. `--lidar-keep-unseen` ships them.
+
+`skew=` on the stats line is the sweep-to-current-frame capture-time difference —
+a whole-sweep summary, no longer what decides any one point's colour. `in_time`
+on the wire still separates the two reasons a return is short of a good colour:
+measured at the wrong moment (timing) versus outside every lens (geometry,
+expected). `coloured` can now exceed `in_time`; the excess is `stale`.
+
+**If a whole sweep goes gray, suspect the capture clock, not the lidar.** The
+Jetson has no RTC, and an NTP step landing after `estimate.CaptureClock` sampled
+its offset makes every frame time wrong by that step, so every point looks
+untimely for the life of the process — seen here as 58 minutes and 7.2 hours of
+`skew=`. `frame_time()` re-baselines past a 1 s step and logs `[capture-clock]`;
+a `skew=` in seconds or more is that fault, tens of ms is normal.
 
 ### What it costs
 

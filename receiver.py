@@ -232,6 +232,12 @@ def render_lidar(sweep, size=520, max_range=12.0):
     rgb = sweep.get("rgb") or []
     cam = sweep.get("cam") or []
     det = sweep.get("det") or []
+    age = sweep.get("age_ms") or []
+    # Past this, a colour came from a frame far enough away in time to be worth
+    # showing as less certain rather than as fact. Matches the sender's default
+    # --lidar-max-skew, and is only a display choice: `age_ms` is per point and a
+    # consumer with a different tolerance should use its own number here.
+    stale_ms = 40.0
     for i in range(min(len(xs), len(zs))):
         px = cx + xs[i] * scale
         py = cy - zs[i] * scale
@@ -240,12 +246,20 @@ def render_lidar(sweep, size=520, max_range=12.0):
         c = int(cam[i]) if i < len(cam) else -1
         if c < 0:
             # No camera saw it. Still a real obstacle, so it is drawn -- just in
-            # the colour of "the lidar alone knows this is here".
+            # the colour of "the lidar alone knows this is here". Only reachable
+            # from a sender running --lidar-keep-unseen; by default these returns
+            # never leave the Jetson (see `dropped`).
             col = (105, 115, 125)
             rad = 1.4
         else:
             col = tuple(rgb[3 * i:3 * i + 3]) if 3 * i + 2 < len(rgb) else (200, 200, 200)
             rad = 1.8
+            # Colour sampled from a frame that did not line up: shown, because it
+            # is still the best guess available, but dimmed so it cannot be read
+            # as being as solid as a return the cameras caught in the act.
+            if i < len(age) and age[i] > stale_ms:
+                col = tuple(int(v * 0.55) for v in col)
+                rad = 1.4
         if i < len(det) and det[i] >= 0:
             rad = 3.2      # attributed to a detection: this return is a known buoy
             d.ellipse([px - rad - 2, py - rad - 2, px + rad + 2, py + rad + 2],
@@ -256,6 +270,8 @@ def render_lidar(sweep, size=520, max_range=12.0):
     skew = sweep.get("skew_ms") or []
     tag = (f"{sweep.get('n', 0)} pts  {sweep.get('coloured', 0)} coloured  "
            f"{sweep.get('hz') or 0:.1f} Hz")
+    if sweep.get("stale"):
+        tag += f"  ({sweep['stale']} stale)"
     if skew and skew[0] is not None:
         tag += f"  skew {skew[0]:+.0f} ms"
     d.rectangle([0, size - 15, d.textlength(tag) + 6, size], fill=(0, 0, 0))

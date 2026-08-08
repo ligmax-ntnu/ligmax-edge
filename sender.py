@@ -55,6 +55,7 @@ Tracker, since the exported engine has no tracker of its own.
   ./sender.py --no-rotate --wb auto --no-track
 """
 import argparse
+import collections
 import json
 import math
 import os
@@ -457,18 +458,26 @@ def _cloud_line(cloud):
     return "/".join(parts)
 
 
-def _lidar_line(reader, lit, skew_ms, fuse_ms):
+def _lidar_line(reader, lit, stale, skew_ms, fuse_ms):
     """Points, how many the cameras could colour, and the frame-to-sweep skew.
 
     `skew` is the one to watch: it is how far apart in capture time the sweep and
     the frame that coloured it were, and it is the number that goes wrong quietly
     if the sweep buffer is ever too short for the camera pipeline's latency.
+
+    `lit` should now sit near the share of a rotation the two lenses cover, and
+    stay there: with a frame buffer the per-point choice no longer rises and falls
+    with `skew` the way it did on one frame. The parenthesised count is how many
+    of those were coloured from outside --lidar-max-skew. A few is the buffer
+    doing its job at the edges of the rotation; most of them means the cameras
+    and the scanner have drifted apart far enough to be worth a look.
     """
     st = reader.stats()
     if not st["healthy"]:
         return f"DOWN({st['last_error'] or 'connecting'})"
-    return (f"{st['points']}pts/{st['hz']:.1f}Hz lit={lit} "
-            f"skew={skew_ms:.0f}ms fuse={fuse_ms:.1f}ms"
+    return (f"{st['points']}pts/{st['hz']:.1f}Hz lit={lit}"
+            + (f"({stale} stale)" if stale else "")
+            + f" skew={skew_ms:.0f}ms fuse={fuse_ms:.1f}ms"
             + (f" err={st['errors']}" if st["errors"] else ""))
 
 
@@ -541,11 +550,33 @@ def main():
                          "there is no way to say where a return lands in an image, "
                          "so the sweep ships uncoloured and detections get no range.")
     ap.add_argument("--lidar-max-skew", type=float, default=40.0,
-                    help="milliseconds a sweep and a frame may differ in capture "
-                         "time and still be colourised together. Points outside it "
-                         "are still sent, just uncoloured -- a return is valid "
-                         "whatever the cameras were doing, but a colour sampled "
-                         "from a frame that does not line up is worse than none.")
+                    help="milliseconds a return and the frame colouring it may "
+                         "differ in capture time and still count as TIMELY. Not a "
+                         "switch: points outside it are still coloured, from the "
+                         "closest frame there is, but are counted in `stale` and "
+                         "carry their own `age_ms` so a consumer can tell.")
+    ap.add_argument("--lidar-frame-history", type=int, default=2,
+                    help="detector frames buffered per camera, on top of the "
+                         "current one, for colouring only. A rotation is 100 ms "
+                         "and a frame is an instant, so one frame is never near "
+                         "all of a sweep; 2 (three frames total, ~100 ms apart) "
+                         "covers a rotation either side. 0 restores the old "
+                         "one-frame behaviour. Costs ~2.4 MB per frame per camera.")
+    ap.add_argument("--lidar-keep-unseen", action="store_true",
+                    help="ship returns no camera could see, uncoloured, instead "
+                         "of dropping them. They are real obstacles -- the ~34 deg "
+                         "aft wedge outside both lenses on this rig -- so this is "
+                         "the safe setting if nothing else watches behind. The "
+                         "default drops them: it shortens the box tests, the eight "
+                         "columnar arrays and the wire, and keeps grey dots off "
+                         "the plot, on the assumption the aft lidar has that arc.")
+    ap.add_argument("--lidar-max-age", type=float, default=250.0,
+                    help="milliseconds past which a frame is too old to colour "
+                         "from at all, and the point ships uncoloured. This is a "
+                         "STALL GUARD, not the quality gate -- buffered frames sit "
+                         "~100 ms apart so it never bites in normal running, only "
+                         "when a camera has stopped producing and the buffer has "
+                         "gone stagnant. 0 for no bound beyond the buffer itself.")
     ap.add_argument("--no-rotate", action="store_true",
                     help="upright mount; skip the 180 degree rotation")
     ap.add_argument("--saturation", type=float, default=2.0,
@@ -559,7 +590,7 @@ def main():
                          "and it is free (the ISP is already converting), whereas "
                          "the matrix in fusion.py is affordable for 400 lidar "
                          "points but not for 819k detector pixels. Measured over "
-                         "real frames: chroma 30.1 -> 59.9, clipping 0.0 -> 2.8%. "
+                         "real frames: chroma 30.1 -> 59.9, clipping 0.0 -> 2.8%%. "
                          "Set 1.0 to restore the old sensor-native behaviour; "
                          "fusion picks up the rest of the correction either way.")
     ap.add_argument("--wb", default="daylight", choices=WB_MODES,
@@ -767,6 +798,14 @@ def main():
     lidar_seq = 0
     lidar_skew = 0.0        # ms, |sweep t_mid - frame t_capture|, last fused
     lidar_lit = 0           # points of the last sweep that got a colour
+    lidar_stale = 0         # of those, coloured from outside --lidar-max-skew
+    # The last few detector frames per camera, newest first, for colouring. A
+    # rotation is 100 ms and a frame is an instant, so one frame cannot be close
+    # in time to a whole sweep; a couple of older ones let each return be coloured
+    # from the frame exposed nearest to it. sample_to_rgb already copies out of
+    # the GStreamer buffer, so keeping these across frames is safe.
+    frame_hist = [collections.deque(maxlen=max(0, args.lidar_frame_history)),
+                  collections.deque(maxlen=max(0, args.lidar_frame_history))]
     fuse_ms = 0.0           # time in the fusion block, summed over the window
     fuse_n = 0
     frames = 0
@@ -912,7 +951,11 @@ def main():
                 t_caps = [clock.frame_time(ptss[i]) for i in (0, 1)]
                 sweep, _ = reader.sweep_near(t_caps[0])
                 if sweep is not None:
-                    views = [fusion.View(i, cams[i], rgbs[i], per_cam[i])
+                    # The boxes belong to THIS frame, so it stays the View's own
+                    # `rgb`; the buffered ones are offered for colour only, and
+                    # only where they were exposed nearer to a given return.
+                    views = [fusion.View(i, cams[i], rgbs[i], per_cam[i],
+                                         history=frame_hist[i])
                              for i in (0, 1)]
                     # Fuse on EVERY frame, so detections always carry a lidar
                     # range -- but build the point cloud only for a sweep the Pi
@@ -924,6 +967,9 @@ def main():
                     try:
                         pts = fusion.fuse(sweep, rig, views,
                                           max_skew=args.lidar_max_skew / 1000.0,
+                                          max_age=(args.lidar_max_age / 1000.0
+                                                   or None),
+                                          drop_unseen=not args.lidar_keep_unseen,
                                           t_caps=t_caps, build_cloud=fresh,
                                           ccm_strength=ccm_strength)
                     except Exception:           # geometry must never kill a frame
@@ -933,7 +979,13 @@ def main():
                     if fresh and pts is not None:
                         last_sweep = sweep.seq
                         lidar_lit = pts["coloured"]
+                        lidar_stale = pts["stale"]
                         cloud_pts = pts
+                # AFTER fusing, so a View is never offered the frame it is already
+                # holding as `rgb` -- that would make the nearest-frame choice a
+                # tie with itself and waste a buffer slot on a duplicate.
+                for i in (0, 1):
+                    frame_hist[i].appendleft((rgbs[i], t_caps[i]))
                 # Kept on the stats line, not just measured once: this is the
                 # only part of the frame budget the lidar can eat, and the budget
                 # has ~10 ms of slack in it.
@@ -1013,7 +1065,7 @@ def main():
                       f"stale_full={y_stale[0]}/{y_stale[1]} "
                       f"est_err={est_err[0]} "
                       f"link={'up' if tx.connected else 'DOWN'}"
-                      + (f"  lidar={_lidar_line(reader, lidar_lit, lidar_skew, fuse_ms / max(fuse_n, 1))}"
+                      + (f"  lidar={_lidar_line(reader, lidar_lit, lidar_stale, lidar_skew, fuse_ms / max(fuse_n, 1))}"
                          if reader else "")
                       + (f"  cloud={_cloud_line(cloud)}" if cloud else ""),
                       flush=True)

@@ -25,6 +25,15 @@ KEY = os.environ.get("LIGMAX_NODE_KEY", "")
 POLL = 30  # seconds between /pending checks
 TICK = 1  # how often we look at the child, so a restart is not a poll behind
 
+# Wall-clock, and shared across every child this process ever starts -- NOT
+# reset each time a new one is spawned. run.sh's own preflight can fail in
+# under a second when the cameras are latched in their Argus error state (see
+# run.sh), and that state only clears on a power cycle. A child that keeps
+# dying faster than POLL seconds must not be able to keep re-arming a 30 s
+# countdown forever: that starves /pending completely, and the dashboard sees
+# no poll ever, even though this process has been running the whole time.
+_next_poll = 0.0
+
 
 def say(msg):
     # Goes to the journal: journalctl -u ligmax-edge -f
@@ -47,24 +56,40 @@ def head():
     ).stdout.strip()
 
 
-def wait_for_work(child):
-    """Block until the child exits or the dashboard asks for a pull.
+def poll_if_due():
+    """Check /pending, but only once every POLL seconds of wall clock.
 
-    Returns the nonce of a request, or None if the child exited on its own.
+    Timer is module-global on purpose -- see the comment on `_next_poll`.
     """
-    next_poll = time.time() + POLL
-    while child.poll() is None:
-        time.sleep(TICK)
-        if time.time() < next_poll:
-            continue
-        next_poll = time.time() + POLL
-        try:
-            pending = ask("/pending")
-            if pending.get("requested"):
-                return pending.get("nonce")
-        except Exception:
-            pass  # dashboard unreachable is normal in the field; keep running
+    global _next_poll
+    if time.time() < _next_poll:
+        return None
+    _next_poll = time.time() + POLL
+    try:
+        pending = ask("/pending")
+        if pending.get("requested"):
+            return pending.get("nonce")
+    except Exception:
+        pass  # dashboard unreachable is normal in the field; keep running
     return None
+
+
+def wait(child=None, seconds=None):
+    """Tick once a second, polling on schedule, until the child exits or
+    `seconds` run out -- whichever bound is given. Used both while the child
+    is up and during the gap before restarting a dead one, so a poll is never
+    contingent on the child staying alive.
+    """
+    deadline = None if seconds is None else time.time() + seconds
+    while True:
+        if child is not None and child.poll() is not None:
+            return None
+        if deadline is not None and time.time() >= deadline:
+            return None
+        time.sleep(TICK)
+        nonce = poll_if_due()
+        if nonce is not None:
+            return nonce
 
 
 while True:
@@ -72,7 +97,15 @@ while True:
     child = subprocess.Popen(START, cwd=REPO, start_new_session=True)
     say(f"started {START[0]} as pid {child.pid} at {head()[:8]}")
 
-    nonce = wait_for_work(child)
+    nonce = wait(child=child)
+    if nonce is None:
+        # run.sh exits non-zero when the cameras are in a latched Argus error state,
+        # which only a power cycle clears. Retrying is still right: it logs the
+        # reason every 5 s, which is what tells you it is the cameras and not the code.
+        say(f"{START[0]} exited with {child.returncode}; restarting in 5s")
+        # Still polling here, not a bare sleep(5): a child that never lives
+        # longer than the retry gap must not be able to hide every poll inside it.
+        nonce = wait(seconds=5)
 
     # Keyed off the request, not off whether the child is still up. Gating the
     # pull on `child.poll() is None` meant a run.sh that had died during the poll
@@ -111,9 +144,3 @@ while True:
             say("pull failed - restarting the old code")
         elif before == head():
             say("nothing new")
-    else:
-        # run.sh exits non-zero when the cameras are in a latched Argus error state,
-        # which only a power cycle clears. Retrying is still right: it logs the
-        # reason every 5 s, which is what tells you it is the cameras and not the code.
-        say(f"{START[0]} exited with {child.returncode}; restarting in 5s")
-        time.sleep(5)

@@ -11,7 +11,14 @@
 # idVendor/idProduct alone: the CP2102N is a generic USB-UART bridge, so
 # matching on vendor/product would also claim any other CP2102N on the board.
 #
+# The flip side of serial-keying: SWAPPING THE SENSOR BREAKS THIS RULE. The
+# serial belongs to the USB-UART bridge, not to the model, so a replacement
+# unit - even an identical one - has a different one, the rule stops matching,
+# no symlink is created, and config.lidar_port() raises. To re-key it:
+#   udevadm info -a -n /dev/ttyUSB0 | grep '{serial}'
+# and paste the value below.
+#
 # GROUP="plugdev" rather than the usual "dialout": it's what jadmin already
 # belongs to on the Jetson image, and adding a device-specific rule is less
 # to reason about than adding the account to a new group.
-SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{serial}=="ea6d25d25a6eef118206e3c2c169b110", SYMLINK+="ligmax-lidar", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{serial}=="84bb03ad556eef119ddee0c2c169b110", SYMLINK+="ligmax-lidar", GROUP="plugdev", MODE="0660"

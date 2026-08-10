@@ -458,7 +458,7 @@ def _cloud_line(cloud):
     return "/".join(parts)
 
 
-def _lidar_line(reader, lit, stale, skew_ms, fuse_ms):
+def _lidar_line(reader, lit, stale, self_n, skew_ms, fuse_ms):
     """Points, how many the cameras could colour, and the frame-to-sweep skew.
 
     `skew` is the one to watch: it is how far apart in capture time the sweep and
@@ -471,14 +471,38 @@ def _lidar_line(reader, lit, stale, skew_ms, fuse_ms):
     of those were coloured from outside --lidar-max-skew. A few is the buffer
     doing its job at the edges of the rotation; most of them means the cameras
     and the scanner have drifted apart far enough to be worth a look.
+
+    `self` is how many returns rig.json's `self_box` took off the boat itself. It
+    should be a steady couple of dozen -- the deck does not move. A drop to zero
+    on a rig that was reporting some means the mask and the world have parted
+    company (the lidar's yaw, or the box), and that is worth more than it looks:
+    it is also the shape of the deck being shipped as obstacles again.
     """
     st = reader.stats()
     if not st["healthy"]:
         return f"DOWN({st['last_error'] or 'connecting'})"
     return (f"{st['points']}pts/{st['hz']:.1f}Hz lit={lit}"
             + (f"({stale} stale)" if stale else "")
+            + (f" self={self_n}" if self_n else "")
             + f" skew={skew_ms:.0f}ms fuse={fuse_ms:.1f}ms"
             + (f" err={st['errors']}" if st["errors"] else ""))
+
+
+def _parse_self_box_arg(text):
+    """"HALFW,FRONT,BACK" -> what fusion.Rig.self_box wants, or raise.
+
+    Raises rather than falling back to the rig file: a typo'd override that
+    silently ran the default would look exactly like the override working.
+    """
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 3:
+        raise SystemExit(f"--lidar-self-box wants HALFW,FRONT,BACK, got {text!r}")
+    hw, front, back = parts
+    return fusion.parse_self_box({
+        "half_width_m": float(hw),
+        "front_m": float(front),
+        "back_m": None if back.lower() in ("", "none", "null") else float(back),
+    })
 
 
 def main():
@@ -570,6 +594,20 @@ def main():
                          "default drops them: it shortens the box tests, the eight "
                          "columnar arrays and the wire, and keeps grey dots off "
                          "the plot, on the assumption the aft lidar has that arc.")
+    ap.add_argument("--no-lidar-self-box", action="store_true",
+                    help="ship the returns that came off the boat itself instead "
+                         "of masking them. The default discards everything inside "
+                         "rig.json's `self_box` -- a corridor 0.70 m either side "
+                         "of the centreline running aft from the lidar -- because "
+                         "a 360 deg scanner on the bow sees its own deck, and a "
+                         "hull return inside a detection box is the nearest one "
+                         "in it, so it takes the range. Use this to SEE what the "
+                         "mask is eating before changing the numbers.")
+    ap.add_argument("--lidar-self-box", default=None, metavar="HALFW,FRONT,BACK",
+                    help="override rig.json's self_box for one run, in metres in "
+                         "the rig frame: half-width either side of the centreline, "
+                         "the forward edge, and the aft edge (empty or 'none' for "
+                         "no aft edge). E.g. 0.9,0.0,none")
     ap.add_argument("--lidar-max-age", type=float, default=250.0,
                     help="milliseconds past which a frame is too old to colour "
                          "from at all, and the point ships uncoloured. This is a "
@@ -736,6 +774,10 @@ def main():
     if not args.no_lidar:
         try:
             rig = fusion.Rig.load(args.rig)
+            if args.lidar_self_box:
+                # Parsed here rather than in Rig so the file stays the one place
+                # the geometry LIVES, and this stays visibly a one-run override.
+                rig.self_box = _parse_self_box_arg(args.lidar_self_box)
             print(f"rig {args.rig}:\n{rig.describe()}")
         except OSError as e:
             print(f"[warn] no rig geometry ({e}); the sweep will ship uncoloured "
@@ -799,6 +841,7 @@ def main():
     lidar_skew = 0.0        # ms, |sweep t_mid - frame t_capture|, last fused
     lidar_lit = 0           # points of the last sweep that got a colour
     lidar_stale = 0         # of those, coloured from outside --lidar-max-skew
+    lidar_self = 0          # points of the last sweep masked off as our own hull
     # The last few detector frames per camera, newest first, for colouring. A
     # rotation is 100 ms and a frame is an instant, so one frame cannot be close
     # in time to a whole sweep; a couple of older ones let each return be coloured
@@ -970,6 +1013,7 @@ def main():
                                           max_age=(args.lidar_max_age / 1000.0
                                                    or None),
                                           drop_unseen=not args.lidar_keep_unseen,
+                                          drop_self=not args.no_lidar_self_box,
                                           t_caps=t_caps, build_cloud=fresh,
                                           ccm_strength=ccm_strength)
                     except Exception:           # geometry must never kill a frame
@@ -980,6 +1024,7 @@ def main():
                         last_sweep = sweep.seq
                         lidar_lit = pts["coloured"]
                         lidar_stale = pts["stale"]
+                        lidar_self = pts["n_self"]
                         cloud_pts = pts
                 # AFTER fusing, so a View is never offered the frame it is already
                 # holding as `rgb` -- that would make the nearest-frame choice a
@@ -1065,7 +1110,7 @@ def main():
                       f"stale_full={y_stale[0]}/{y_stale[1]} "
                       f"est_err={est_err[0]} "
                       f"link={'up' if tx.connected else 'DOWN'}"
-                      + (f"  lidar={_lidar_line(reader, lidar_lit, lidar_stale, lidar_skew, fuse_ms / max(fuse_n, 1))}"
+                      + (f"  lidar={_lidar_line(reader, lidar_lit, lidar_stale, lidar_self, lidar_skew, fuse_ms / max(fuse_n, 1))}"
                          if reader else "")
                       + (f"  cloud={_cloud_line(cloud)}" if cloud else ""),
                       flush=True)

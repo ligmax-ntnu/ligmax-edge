@@ -272,6 +272,12 @@ def render_lidar(sweep, size=520, max_range=12.0):
            f"{sweep.get('hz') or 0:.1f} Hz")
     if sweep.get("stale"):
         tag += f"  ({sweep['stale']} stale)"
+    if sweep.get("n_self"):
+        # Masked as our own hull on the Jetson (rig.json self_box), so there is
+        # nothing to draw -- but shown, because a plot with a clean centre and no
+        # note reads as a lidar that cannot see the deck rather than one whose
+        # deck returns were removed on purpose.
+        tag += f"  ({sweep['n_self']} self)"
     if skew and skew[0] is not None:
         tag += f"  skew {skew[0]:+.0f} ms"
     d.rectangle([0, size - 15, d.textlength(tag) + 6, size], fill=(0, 0, 0))

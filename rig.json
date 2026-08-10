@@ -103,6 +103,42 @@
     ]
   },
 
+  "_self_box": [
+    "THE BOAT ITSELF. A 360 deg planar scanner on the bow sees the vessel it is",
+    "bolted to: the superstructure, the mast, the aft lidar's housing and anything",
+    "stowed on deck all come back as solid returns at 1-3 m, and to a range-only",
+    "sensor those are indistinguishable from a mark that close. Every return inside",
+    "this box is discarded in fusion.fuse before anything projects, colours or",
+    "ranges it, and the count ships as `n_self`.",
+    "",
+    "The box is in the RIG frame (+x starboard, +z forward), so a return is the",
+    "boat when",
+    "    |x| <= half_width_m   and   back_m <= z <= front_m",
+    "half_width_m is EITHER SIDE of the centreline, so 0.70 is a 1.40 m corridor.",
+    "front_m 0.0 is the lidar's own plane: the box starts at the sensor and runs",
+    "AFT. back_m null means no rear edge, because the hull and the deck run astern",
+    "and no measured length says where they stop -- an open corridor astern is the",
+    "same statement drop_unseen already makes, that the AFT lidar owns behind.",
+    "",
+    "These are the requested dimensions, NOT measured against the hull, and they",
+    "are worth checking on the boat before they are trusted: with the mask off",
+    "(sender.py --no-lidar-self-box) the deck's returns are visible on the",
+    "receiver's top-down plot, and the box should cover them and nothing else.",
+    "",
+    "IT DEPENDS ON THE LIDAR YAW ABOVE, which is STALE. `aft` here means -z in the",
+    "rig frame, and which physical direction that is comes entirely from",
+    "lidar.yaw_deg -- so while that number is the pre-remount value, this box is",
+    "pointing 90-ish deg away from the stern and is masking open water instead of",
+    "the deck. Remeasure the yaw first; the box only means what it says once it is",
+    "right. Set this to false to switch the mask off for a rig that does not need",
+    "it (a sensor that sees no part of its own vessel)."
+  ],
+  "self_box": {
+    "half_width_m": 0.70,
+    "front_m": 0.0,
+    "back_m": null
+  },
+
   "_cams": [
     "xyz is 5 cm along each camera's own pointing direction, per the rule above:",
     "0.05 * (sin(yaw), 0, cos(yaw)) with y = -0.05 for the height over the scan",

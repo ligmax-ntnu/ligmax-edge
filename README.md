@@ -337,10 +337,44 @@ has stalled and left the buffer stagnant; only there do points ship uncoloured.
 
 Returns **no camera could see at all** — the ~34° aft wedge outside both lenses —
 are dropped rather than shipped grey. `n` is then the points in the arrays and
-`dropped` how many were removed, so a returns-per-rev check wants `n + dropped`.
+`dropped` how many were removed (and see `n_self` below: a rev is
+`n + dropped + n_self`).
 This is a data decision, not a speed one: it assumes the aft lidar watches that
 arc, and it buys ~10 % of the wire but only ~1 % of `fuse`, since the work was
 never in the points no camera could see. `--lidar-keep-unseen` ships them.
+
+### The boat is in the way
+
+A 360° planar scanner on the bow sees **the vessel it is bolted to**: the
+superstructure, the mast, the aft lidar's housing, anything stowed on deck. To a
+range-only sensor those are the same measurement as a mark at 2 m — and worse, a
+hull return that lands inside a detection box is the *nearest* return in it, so it
+wins the foreground cluster and the buoy 8 m away is reported at 2 m.
+
+So `fuse` discards them geometrically, first thing, before anything is projected
+or coloured: **`self_box` in [rig.json](rig.json)**, a box in the rig frame the
+hull occupies. Default **0.70 m either side of the centreline, from the lidar's
+own plane (`z = 0`) running aft with no rear edge** — a 1.40 m corridor astern,
+which at 3 m range is a 27° arc and ~27 of ~360 returns. No rear edge because
+nothing measured says where the deck stops, and behind is the aft lidar's arc
+anyway. A box in metres, not an angular wedge, because the hull subtends a wide
+arc up close and a narrow one further aft; a fixed wedge either keeps stern
+returns or eats open water off the bow quarter.
+
+The count ships as **`n_self`** and appears as `self=` on the stats line and
+`(N self)` on the receiver's plot, so it is never a silent removal. A
+returns-per-rev check therefore wants `n + dropped + n_self`.
+
+```bash
+./sender.py --no-lidar-self-box --lidar-keep-unseen   # see what the mask eats
+./sender.py --lidar-self-box 0.9,0.0,none            # try other numbers, no edit
+```
+
+**These are requested dimensions, not measured against the hull**, and the box's
+meaning depends entirely on `lidar.yaw_deg` — which is stale since the 2026-08-08
+remount, so "aft" is currently pointing ~90° away from the stern. Fix the yaw
+first, then check the box; the two failures look identical from shore, and both
+look like a working plot.
 
 `skew=` on the stats line is the sweep-to-current-frame capture-time difference —
 a whole-sweep summary, no longer what decides any one point's colour. `in_time`

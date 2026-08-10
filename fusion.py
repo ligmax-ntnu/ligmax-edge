@@ -72,6 +72,17 @@ Be clear about what it costs: they are real obstacles the scanner measured, and
 dropping them is a statement that the aft lidar covers that arc. It is not a
 speed measure -- it saves ~1 % of `fuse` and ~10 % of the wire, because the work
 was never in the points no camera could see.
+
+The boat itself
+---------------
+The scanner sees the vessel it is bolted to. A 360 deg planar sweep from the bow
+mast sweeps straight down the deck, so the superstructure, the mast, the aft
+lidar's own housing and anything stowed astern all come back as solid returns at
+1-3 m -- indistinguishable, to a range-only sensor, from a mark that close. Those
+are removed geometrically, by `Rig.self_mask`: a box in the RIG frame that the
+hull occupies, and every return inside it is discarded before anything projects,
+colours or ranges it. See `self_box` in rig.json for the numbers and how to
+change them; `n_self` on the wire is how many it took.
 """
 from __future__ import annotations
 
@@ -90,6 +101,23 @@ RANGE_ACCURACY_M = 0.03
 # a little projection error. Raise it for larger targets -- but not far, or the
 # sea behind the buoy starts counting as the buoy.
 FOREGROUND_GATE_M = 0.5
+
+# The vessel's own footprint in the RIG frame, as (half_width, front, back) in
+# metres: a return is the boat if |x| <= half_width and back <= z <= front.
+#
+# 0.70 m EITHER SIDE of the rig's centreline, and from the lidar's own plane (z =
+# 0) aft indefinitely -- `back` is None for "no rear edge", because the hull, the
+# aft lidar and whatever is stowed on deck all lie astern of the front unit and
+# there is no measured length at which they stop. A rear edge is a number nobody
+# has measured; an open corridor astern is a statement that the AFT lidar owns
+# everything behind this one, which is the same division of labour `drop_unseen`
+# already assumes for the ~34 deg wedge outside both lenses.
+#
+# Overridable per rig in rig.json (`self_box`) and per run from sender.py
+# (`--lidar-self-box`, `--no-lidar-self-box`). Widen it if returns off the deck
+# still get through; narrow it before believing a target 1 m off the bow quarter
+# has vanished, because this is the one thing that would silently eat it.
+SELF_BOX = (0.70, 0.0, None)
 
 # Colour is averaged over a small window rather than taken from one pixel, so a
 # single hot pixel or a hair of projection error does not decide the answer.
@@ -127,6 +155,29 @@ STALE_COST = 10.0
 OV5647_CCM = np.array(((1.714, -0.538, -0.177),
                        (-0.097, 1.646, -0.549),
                        (-0.113, -0.911, 2.024)), dtype=np.float32)
+
+
+def parse_self_box(sb):
+    """rig.json's `self_box` -> (half_width, front, back), or None if disabled.
+
+    `false` in the file turns the mask off entirely, and so does an empty box; a
+    missing key, or an object giving only some of the three, falls back to
+    SELF_BOX, so a rig that only needs a different width writes one number.
+    `back: null` means no rear edge -- kept distinguishable from 0.0, which would
+    be a box of zero depth.
+    """
+    if sb is None:
+        return SELF_BOX
+    if sb is False:
+        return None
+    hw, front, back = SELF_BOX
+    hw = float(sb.get("half_width_m", hw))
+    front = float(sb.get("front_m", front))
+    back = sb.get("back_m", back)
+    back = None if back is None else float(back)
+    if hw <= 0.0 or (back is not None and back >= front):
+        return None             # an empty box masks nothing; say so once, here
+    return (hw, front, back)
 
 
 def _rot(yaw_deg, pitch_deg, roll_deg):
@@ -181,6 +232,7 @@ class Rig:
         self.angle_dir = 1.0 if int(ld.get("angle_dir", 1)) >= 0 else -1.0
         self.angle_zero = float(ld.get("angle_zero_deg", 0.0))
         self.cams = [Pose.from_dict(spec.get(f"cam{i}", {})) for i in (0, 1)]
+        self.self_box = parse_self_box(spec.get("self_box"))
         self.spec = spec
 
     @classmethod
@@ -193,7 +245,33 @@ class Rig:
                  f"angle_dir {self.angle_dir:+.0f} zero {self.angle_zero:+.1f} deg"]
         for i, c in enumerate(self.cams):
             lines.append(f"  cam{i}:  {c.describe()}")
+        if self.self_box is None:
+            lines.append("  self box: off -- the boat's own returns will ship")
+        else:
+            hw, front, back = self.self_box
+            span = (f"<= {front:+.2f}" if back is None
+                    else f"in [{back:+.2f}, {front:+.2f}]")
+            lines.append(f"  self box: |x| <= {hw:.2f} m, z {span} m")
         return "\n".join(lines)
+
+    def self_mask(self, p_rig):
+        """(N,) bool: which rig-frame points are the vessel itself, not the world.
+
+        A box test, not a bearing test, and that is the point. The hull subtends a
+        wide arc up close and a narrow one further aft, so a fixed angular wedge
+        either keeps deck returns at the stern or eats open water off the bow
+        quarter; a box in metres is the shape the boat actually is.
+
+        All-False if the mask is disabled, so callers need no second branch.
+        """
+        n = np.asarray(p_rig).shape[0]
+        if self.self_box is None or n == 0:
+            return np.zeros(n, dtype=bool)
+        hw, front, back = self.self_box
+        m = (np.abs(p_rig[:, 0]) <= hw) & (p_rig[:, 2] <= front)
+        if back is not None:
+            m &= p_rig[:, 2] >= back
+        return m
 
     def sweep_to_rig(self, sweep):
         """Sweep -> (N,3) points in the rig frame.
@@ -335,7 +413,7 @@ def _correct(rgb, strength=1.0):
 
 def fuse(sweep, rig, views, max_skew=0.06, t_caps=None,
          foreground_gate=FOREGROUND_GATE_M, build_cloud=True, ccm_strength=1.0,
-         max_age=None, drop_unseen=True):
+         max_age=None, drop_unseen=True, drop_self=True):
     """Colour a sweep and hang a lidar range off every detection it lands in.
 
     `views` may hold None for a camera that has no calibration or no frame this
@@ -363,13 +441,36 @@ def fuse(sweep, rig, views, max_skew=0.06, t_caps=None,
     so it is a statement that something else is watching that arc. `n` is then
     the number of points in the arrays, and `dropped` how many were removed.
 
+    `drop_self` removes the returns that came off the boat itself, per
+    `Rig.self_mask`. On by default and it should stay that way in flight: those
+    returns are the hull at 1-3 m, and a detection box that catches one gets the
+    deck's range instead of the buoy's. Turn it off (`--no-lidar-self-box`) only
+    to see what the mask is eating.
+
     Mutates each detection dict in `views[i].dets`, adding a `lidar` block to the
     ones that got returns. Returns the columnar point cloud that goes on the wire.
     """
     p_rig = rig.sweep_to_rig(sweep)
-    n = p_rig.shape[0]
     t_pt = sweep.times()
     quality = sweep.quality
+
+    # ---- drop the boat itself, before anything is projected or coloured
+    #
+    # First, deliberately: these returns are not obstacles, they are the vessel
+    # this sensor is bolted to, so every metre of work after this line -- the
+    # projection, the colour sampling, the detection box tests, the wire -- is
+    # work on the world rather than on the deck. It also has to be before the
+    # box tests specifically: a hull return that lands inside a detection is the
+    # NEAREST return in that box, so it would win the foreground cluster outright
+    # and report a 2 m range for a buoy 8 m away.
+    n_self = 0
+    if drop_self:
+        mine = rig.self_mask(p_rig)
+        n_self = int(mine.sum())
+        if n_self:
+            keep = ~mine
+            p_rig, t_pt, quality = p_rig[keep], t_pt[keep], quality[keep]
+    n = p_rig.shape[0]
 
     cam_of = np.full(n, -1, dtype=np.int8)
     rgb_of = np.zeros((n, 3), dtype=np.uint8)
@@ -563,11 +664,17 @@ def fuse(sweep, rig, views, max_skew=0.06, t_caps=None,
     return {
         "seq": int(sweep.seq),
         "frame": "rig",
-        # Points IN THESE ARRAYS, which is what every consumer indexes by. With
-        # drop_unseen it is no longer the size of the rotation -- `n + dropped`
-        # is, and a rate check wants that sum, not this.
+        # Points IN THESE ARRAYS, which is what every consumer indexes by. It is
+        # no longer the size of the rotation -- `n + dropped + n_self` is, and a
+        # rate check wants that sum, not this.
         "n": int(n),
         "dropped": dropped,
+        # Returns discarded as the boat's own hull (Rig.self_mask). Reported
+        # rather than silently removed: this is a fixed box in front of a sensor
+        # that can see real targets at 0.5 m, so if it ever starts eating the
+        # world this is the number that says so -- and a sudden 0 on a rig that
+        # normally reports tens means the mask, or the lidar's yaw, has moved.
+        "n_self": n_self,
         "coloured": coloured,
         "stale": stale,
         "in_time": int(timely_any.sum()) if t_caps is not None else int(n),

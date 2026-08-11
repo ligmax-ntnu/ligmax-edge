@@ -46,12 +46,38 @@ and reach the operator as objects on the map. So a panel with no overlay is a pa
 that cannot show what the detector is seeing, only what the lens is - and the two
 disagreeing is exactly the case worth looking at. `--no-cloud-boxes` turns it off.
 
+Full-resolution stills, which are the opposite of everything above
+------------------------------------------------------------------
+The stream is small, continuous, latest-wins and lossy. A **still** is one whole
+2592x1944 sensor frame per camera, on request, and every rule above is inverted
+for it:
+
+  * it is **queued, not latest-wins** - somebody pressed a button and is waiting;
+  * it is **2-3 MB**, i.e. ten seconds of the stream's entire budget, so it only
+    ever happens when asked for;
+  * it works **while the stream is off**, which is the normal case for it: the
+    reason to want one is to go and photograph the AR tags on the dock, and
+    nobody wants video running for that;
+  * it is **uncropped**, because the detector's 2:1 band is aimed off the bow and
+    the markers are not there (`rig.json`: the cameras look port and starboard).
+
+The request arrives the only way anything can reach this board - as a field on
+the config poll's reply. `wanted_still()` is what `sender.py` checks, and it
+answers with the cameras still outstanding, so a second camera that is slow does
+not make the first one send twice. See `ligmax-server/ligmax_gui/stills.py` for
+the shore half.
+
 Usage, from sender.py:
 
     uplink = CameraUplink.from_env()          # or CameraUplink(url, key)
     ...
     uplink.submit(cam_index, jpeg_bytes, width, height, t_capture,
                   dets=items, det_size=(net_w, net_h))
+
+    if (still := uplink.wanted_still()) is not None:
+        # ... grab the full-res NV12 for the cameras in still["cameras"] ...
+        uplink.submit_still(cam_index, nv12_bytes, w, h, t_capture, still,
+                            meta={"mode": 0, "rotated_180": True})
     ...
     uplink.close()
 """
@@ -84,6 +110,14 @@ ERROR_BACKOFF = 3.0
 REQUEST_TIMEOUT = 8.0
 IDLE_TICK = 0.25
 
+# A still is 2-3 MB and 4G upstream is a couple of Mbit/s on a good day, so one
+# can take ten seconds. Its own timeout, well clear of the frame one: giving up
+# halfway would waste the whole upload and leave the operator pressing again.
+STILL_TIMEOUT = 90.0
+# How many stills may be waiting to go out. Two is one press of the button; four
+# leaves room for a second press while the first pair is still climbing the link.
+STILL_QUEUE = 4
+
 # Refuse to encode above this regardless of what the server asks for. The server
 # clamps too; this is the second half of the same guard, on the side that would
 # actually spend the bandwidth.
@@ -102,6 +136,11 @@ try:
     from PIL import Image, ImageDraw
 except ImportError:  # the viewer host may have it and the Jetson may not
     Image = ImageDraw = None
+
+try:
+    import numpy as np
+except ImportError:  # only the still path needs it; the stream does not
+    np = None
 
 
 class CameraUplink:
@@ -135,6 +174,16 @@ class CameraUplink:
             "jpeg_quality": 55,
             "fps": 2.0,
             "cameras": ["0", "1"],
+            # Whether the YOLO detector should run. Unlike everything else here
+            # this is not about the uplink at all - it is the dashboard's switch
+            # for the *inference* in `sender.py`, and it lives on this poll
+            # because this poll is the only channel that reaches this board.
+            #
+            # Default True so a board that never hears from the dashboard behaves
+            # exactly as it did before this existed. `sender.py --no-detect` is
+            # the other half: that one never loads an engine at all, and no
+            # dashboard toggle can turn inference back on in that process.
+            "detect": True,
         }
 
         self.sent = 0
@@ -143,7 +192,19 @@ class CameraUplink:
         self.last_error: str | None = None
         self.last_config_at = 0.0
 
+        # The outstanding full-resolution capture, as the dashboard describes it,
+        # and which cameras have already been handed over for it. Kept out of
+        # `self.stream` on purpose: `stats()['asked']` is about the *stream*, and
+        # a still is not a stream setting.
+        self.capture: dict | None = None
+        self.stills_sent = 0
+        self.stills_failed = 0
+
         self._pending: dict[str, tuple] = {}
+        # Stills queue rather than overwrite - see the module docstring.
+        self._stills: list[tuple] = []
+        self._still_id = 0
+        self._still_taken: set[str] = set()
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._closed = False
@@ -181,6 +242,15 @@ class CameraUplink:
     @property
     def enabled(self) -> bool:
         return bool(self.stream.get("enabled"))
+
+    @property
+    def detect(self) -> bool:
+        """Whether the dashboard wants the detector running. See `stream`.
+
+        True when it has never said - a board that cannot reach shore keeps
+        detecting, because that is the mode the boat races in.
+        """
+        return bool(self.stream.get("detect", True))
 
     def submit(self, cam, jpeg: bytes, width: int, height: int,
                t_capture: float | None = None, dets=None, det_size=None) -> None:
@@ -261,6 +331,76 @@ class CameraUplink:
                         box[2] / net_w, box[3] / net_h, colour, label))
         return tuple(out)
 
+    # -- full-resolution stills --------------------------------------------
+
+    def wanted_still(self) -> dict | None:
+        """The outstanding capture, or None. Cheap enough for the capture loop.
+
+        Returns `{"id", "cameras", "quality"}` where `cameras` is the ids this
+        board has **not yet handed over** for that request - so a caller can
+        submit them one at a time as frames become available, and a camera whose
+        upload is still climbing the link is not asked for again.
+
+        The dashboard also filters by what it has *received*, and the two
+        together are what make this safe against either end restarting: shore
+        forgets a completed request, and this forgets a superseded one.
+        """
+        capture = self.capture
+        if not capture:
+            return None
+        cameras = [
+            camera for camera in capture.get("cameras") or ()
+            if str(camera) not in self._still_taken
+        ]
+        if not cameras:
+            return None
+        return {
+            "id": capture.get("id"),
+            "cameras": cameras,
+            "quality": int(capture.get("quality") or 92),
+        }
+
+    def submit_still(self, cam, nv12: bytes, width: int, height: int,
+                     t_capture: float | None = None, request: dict | None = None,
+                     meta: dict | None = None) -> bool:
+        """Hand over one full-resolution NV12 frame. Never blocks, never raises.
+
+        **NV12 in, JPEG out, and the conversion happens in the worker thread.**
+        A 5 megapixel colour conversion plus a JPEG encode is a third of a second
+        on this board's CPU - four whole frame periods at mode 0 - so doing it
+        where `submit()` is called would stall capture visibly and, worse,
+        intermittently. What the caller pays is a memcpy of the buffer it already
+        has.
+
+        Returns whether the frame was taken. False means the queue is full or
+        this camera is already in it for this request, which is not an error:
+        the request stays outstanding and the next frame will do.
+        """
+        if self._closed or not nv12:
+            return False
+        camera = str(cam)
+        wanted = request or self.capture or {}
+        request_id = int(wanted.get("id") or 0)
+        quality = int(wanted.get("quality") or 92)
+
+        with self._lock:
+            if request_id != self._still_id:
+                # A new request supersedes an unfinished one outright. The old
+                # frames are of a moment nobody is waiting for any more.
+                self._still_id = request_id
+                self._still_taken = set()
+                self._stills.clear()
+            if camera in self._still_taken:
+                return False
+            if len(self._stills) >= STILL_QUEUE:
+                return False
+            self._still_taken.add(camera)
+            self._stills.append((camera, nv12, int(width), int(height),
+                                 t_capture or time.time(), request_id, quality,
+                                 dict(meta or {})))
+        self._wake.set()
+        return True
+
     def stats(self) -> dict:
         """One line for sender.py's periodic stats print."""
         return {
@@ -277,6 +417,11 @@ class CameraUplink:
                 f"q{self.stream.get('jpeg_quality')} "
                 f"{self.stream.get('fps')}fps"
             ),
+            "stills": self.stills_sent,
+            "stills_failed": self.stills_failed,
+            # Truthy only while a capture is outstanding, so the stats line can
+            # say "capturing" for the few seconds it takes and nothing after.
+            "capturing": bool(self.wanted_still()),
             "last_error": self.last_error,
         }
 
@@ -302,6 +447,17 @@ class CameraUplink:
                 self._last_poll = now
                 self._poll_config()
 
+            # Stills first, and by a wide margin: somebody is waiting for one,
+            # while a preview frame is one of several a second and the next will
+            # do. A still also takes seconds, so anything queued behind it waits
+            # anyway - better that it be a frame that was going to be superseded.
+            with self._lock:
+                stills, self._stills = self._stills, []
+            for entry in stills:
+                if self._closed:
+                    break
+                self._post_still(*entry)
+
             with self._lock:
                 pending = self._pending
                 self._pending = {}
@@ -310,7 +466,7 @@ class CameraUplink:
                     break
                 self._post(camera, *frame)
 
-            if not pending:
+            if not pending and not stills:
                 self._wake.wait(IDLE_TICK)
 
     def _encode(self, jpeg: bytes, width: int, height: int, boxes=()):
@@ -367,6 +523,157 @@ class CameraUplink:
             self.last_error = f"re-encode failed: {exc}"
             self.errors += 1
             return jpeg, width, height
+
+    # -- the still encoder --------------------------------------------------
+
+    @staticmethod
+    def _nv12_to_rgb(nv12: bytes, width: int, height: int):
+        """One NV12 buffer -> an (h, w, 3) uint8 RGB array, or None.
+
+        The buffer must be **unpadded**: Y as h*w bytes followed by interleaved
+        UV as (h/2)*(w/2)*2. `sender.sample_to_nv12` strips the hardware row
+        alignment before handing it over, because honouring a stride here would
+        mean this function needed to know about the VIC.
+
+        **Colour is BT.601 limited range**, which is what this pipeline's
+        `video/x-raw,format=NV12` carries, and it is an assumption rather than a
+        measurement - the caps do not state colorimetry, so a small cast is
+        possible. That matters for looking at the picture and not at all for
+        measuring anything on it: ArUco, and every corner refinement that follows
+        it, works on the **Y plane**, which is carried here exactly as the sensor
+        pipeline produced it. So a still is a faithful measurement image with a
+        colour rendering that may be a shade off, and `colour` in the metadata
+        says which matrix was used rather than leaving it to be guessed at.
+        """
+        if np is None:
+            return None
+        expected = width * height * 3 // 2
+        if width <= 0 or height <= 0 or height % 2 or width % 2:
+            return None
+        if len(nv12) < expected:
+            return None
+        flat = np.frombuffer(nv12[:expected], dtype=np.uint8)
+        y = flat[: width * height].reshape(height, width).astype(np.int32)
+        uv = flat[width * height:].reshape(height // 2, width // 2, 2)
+        # Nearest-neighbour chroma upsample. Bilinear would be marginally nicer
+        # to look at and is not worth 5 megapixels of interpolation for an image
+        # whose luma is the part that gets measured.
+        u = np.repeat(np.repeat(uv[:, :, 0], 2, axis=0), 2, axis=1).astype(np.int32)
+        v = np.repeat(np.repeat(uv[:, :, 1], 2, axis=0), 2, axis=1).astype(np.int32)
+        u = u[:height, :width] - 128
+        v = v[:height, :width] - 128
+        c = (y - 16) * 298
+        rgb = np.empty((height, width, 3), dtype=np.uint8)
+        rgb[:, :, 0] = np.clip((c + 409 * v + 128) >> 8, 0, 255)
+        rgb[:, :, 1] = np.clip((c - 100 * u - 208 * v + 128) >> 8, 0, 255)
+        rgb[:, :, 2] = np.clip((c + 516 * u + 128) >> 8, 0, 255)
+        return rgb
+
+    def _encode_still(self, nv12: bytes, width: int, height: int, quality: int):
+        """NV12 -> (jpeg, w, h, note), or (None, 0, 0, why).
+
+        Falls back to a **grayscale** JPEG of the Y plane when numpy is missing,
+        rather than to nothing: the luma plane is what a marker is measured on, so
+        a colourless still is a fully usable one and an absent still is not.
+        """
+        if Image is None:
+            return None, 0, 0, "Pillow is not installed on this board"
+        out = io.BytesIO()
+        rgb = self._nv12_to_rgb(nv12, width, height)
+        if rgb is not None:
+            image = Image.fromarray(rgb, mode="RGB")
+            note = "bt601-limited"
+        else:
+            need = width * height
+            if len(nv12) < need:
+                return None, 0, 0, f"{len(nv12)} B is short of a {width}x{height} frame"
+            # frombytes rather than the numpy path: this branch exists precisely
+            # for the case where numpy is what is missing.
+            image = Image.frombytes("L", (width, height), nv12[:need])
+            note = "luma-only"
+        image.save(out, format="JPEG", quality=int(quality), optimize=False,
+                   subsampling=0 if note == "bt601-limited" else -1)
+        return out.getvalue(), image.width, image.height, note
+
+    def _post_still(self, camera: str, nv12: bytes, width: int, height: int,
+                    t_capture: float, request_id: int, quality: int,
+                    meta: dict) -> None:
+        """Encode and upload one full-resolution frame. One attempt, then admit it.
+
+        No retry loop, unlike `_post`: a still is 2-3 MB, a failed upload has
+        already spent most of a minute of uplink, and the operator would rather
+        press the button again on a link that is working than have this quietly
+        spend another minute on one that is not. The failure is counted and
+        printed, and the dashboard's request stays outstanding, so the next poll
+        offers it again anyway.
+        """
+        t0 = time.monotonic()
+        jpeg, out_w, out_h, note = self._encode_still(nv12, width, height, quality)
+        if jpeg is None:
+            self.stills_failed += 1
+            self.last_error = f"still encode failed: {note}"
+            print(f"cloud_camera: cam{camera} still not sent - {note}", flush=True)
+            return
+        encode_ms = 1000.0 * (time.monotonic() - t0)
+
+        query = {
+            "cam": camera,
+            "id": request_id,
+            "t": f"{t_capture:.3f}",
+            "width": out_w,
+            "height": out_h,
+            "quality": int(quality),
+            "label": f"cam{camera}",
+            "colour": note,
+            **{k: str(v) for k, v in meta.items()},
+        }
+        path = f"{self.base_path}/api/camera/capture/upload?" \
+               f"{urllib.parse.urlencode(query)}"
+        headers = self._headers(**{"Content-Type": "image/jpeg"})
+
+        # Its own connection, closed afterwards, rather than the keep-alive
+        # socket the stream uses: this write occupies the link for seconds, and
+        # a preview POST that queued behind it would time out and be blamed on
+        # the link. Cheap - a still is a once-in-a-while thing.
+        self._drop_connection()
+        connection = self._get_connection()
+        if connection is None:
+            self.stills_failed += 1
+            return
+        previous, connection.timeout = connection.timeout, STILL_TIMEOUT
+        try:
+            connection.request("POST", path, body=jpeg, headers=headers)
+            response = connection.getresponse()
+            body = response.read()
+        except (http.client.HTTPException, OSError, ssl.SSLError) as exc:
+            self.stills_failed += 1
+            self.last_error = f"still upload failed: {exc or exc.__class__.__name__}"
+            print(f"cloud_camera: cam{camera} still upload failed ({exc})", flush=True)
+            self._drop_connection()
+            return
+        finally:
+            connection.timeout = previous
+            self._drop_connection()
+
+        if response.status == 200:
+            self.stills_sent += 1
+            self.last_error = None
+            print(f"cloud_camera: cam{camera} still {out_w}x{out_h} "
+                  f"{len(jpeg) / 1048576.0:.2f} MB {note} sent "
+                  f"(encode {encode_ms:.0f} ms, "
+                  f"{1000.0 * (time.monotonic() - t0) - encode_ms:.0f} ms upload)",
+                  flush=True)
+            self._absorb(body)
+        else:
+            self.stills_failed += 1
+            self.last_error = f"still HTTP {response.status} {body[:120]!r}"
+            print(f"cloud_camera: cam{camera} still refused - {self.last_error}",
+                  flush=True)
+            if response.status in (401, 403):
+                # Same key as everything else here, so this is not going to
+                # start working. Forget the request rather than re-uploading
+                # 2 MB every poll into a 403.
+                self.capture = None
 
     @staticmethod
     def _overlay(image, boxes):
@@ -511,14 +818,37 @@ class CameraUplink:
         if not isinstance(payload, dict):
             return
         changed = False
-        for key in ("enabled", "max_width", "jpeg_quality", "fps", "cameras"):
+        for key in ("enabled", "max_width", "jpeg_quality", "fps", "cameras",
+                    "detect"):
             if key in payload and payload[key] != self.stream.get(key):
+                if key == "detect":
+                    print(f"cloud_camera: dashboard turns the detector "
+                          f"{'ON' if payload[key] else 'OFF'}", flush=True)
                 self.stream[key] = payload[key]
                 changed = True
+
+        # The capture request is separate from the stream config and is allowed
+        # to be absent, which is the normal case - `"capture": null` on every
+        # reply is what clears a finished one. A *new* id resets which cameras
+        # have been handed over, since those belong to the old request.
+        if "capture" in payload:
+            capture = payload["capture"]
+            capture = capture if isinstance(capture, dict) else None
+            before = (self.capture or {}).get("id")
+            self.capture = capture
+            if capture and capture.get("id") != before:
+                with self._lock:
+                    self._still_id = int(capture.get("id") or 0)
+                    self._still_taken = set()
+                print(f"cloud_camera: full-res capture #{capture.get('id')} "
+                      f"asked for cam{'/cam'.join(str(c) for c in capture.get('cameras') or ())}"
+                      f" at q{capture.get('quality')}", flush=True)
+
         self.last_config_at = time.monotonic()
         if changed:
             print(f"cloud_camera: dashboard asks for {self.stats()['asked']}, "
-                  f"{'streaming' if self.enabled else 'off'}", flush=True)
+                  f"{'streaming' if self.enabled else 'off'}"
+                  f"{'' if self.detect else ', detector off'}", flush=True)
 
     def _get_connection(self):
         if self._connection is None:

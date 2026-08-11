@@ -48,9 +48,27 @@ white balance is pinned to daylight rather than left on auto -- see build_pipeli
 for why both are done where they are. Detections carry a persistent id from
 Tracker, since the exported engine has no tracker of its own.
 
+THIS PROCESS OWNS BOTH SENSORS, which is why two features that look unrelated to
+a detector live in here. Argus hands a CSI sensor to one consumer, so nothing else
+on this board can open cam0 or cam1 while this is running -- there is no "just run
+a little capture script alongside it". So:
+
+  * **full-resolution stills** are taken here, on request, and handed to
+    `cloud_camera` to upload (`--no-cloud` disables them along with the uplink).
+    The whole 2592x1944 frame, not the detector's crop: the crop is a 2:1 band
+    swung off each lens's axis and the AR tags on a dock are not in it.
+  * **the detector can be turned off**, two independent ways. `--no-detect` never
+    loads an engine at all, so this runs as a plain camera on a board where the
+    engines have not been rebuilt; and the dashboard can switch inference off and
+    on at runtime, without restarting capture -- which matters because tearing
+    capture down is what latches Argus into the state only a power cycle clears.
+    Either way the pipeline, the previews, the stills and the lidar all keep
+    running; only the inference stops.
+
   ./sender.py                                       # -> ligmax-pi3.local:3401
   ./sender.py --host 192.168.99.135 --port 3401     # -> a viewer, for bench work
   ./sender.py --no-cloud                            # no dashboard uplink at all
+  ./sender.py --no-detect                           # cameras only, no engine
   ./sender.py --preview 640x320 --conf 0.3
   ./sender.py --no-rotate --wb auto --no-track
 """
@@ -289,6 +307,58 @@ def sample_to_y(sample, w, h):
         buf.unmap(mi)
 
 
+def sample_to_nv12(sample, w, h):
+    """A whole NV12 buffer as UNPADDED bytes -- Y then interleaved UV -- plus PTS.
+
+    `sample_to_y` above takes the luma plane and is what every measurement uses.
+    This takes the colour as well, and is only called when a full-resolution still
+    has been asked for, because it copies 7.5 MB rather than 5.
+
+    The padding is stripped here rather than passed on with a stride, so the far
+    end needs to know nothing about the VIC's row alignment: what comes out is
+    exactly `w*h + w*h/2` bytes. Both plane strides and both plane offsets come
+    from the video meta -- assuming the UV plane starts right after the Y plane is
+    true for the buffers this pipeline produces and is not true in general, and a
+    wrong offset would give a correct-looking picture with wrong colour.
+    """
+    buf = sample.get_buffer()
+    ok, mi = buf.map(Gst.MapFlags.READ)
+    if not ok:
+        return None, None
+    try:
+        stride_y = stride_uv = w
+        off_y, off_uv = 0, None
+        try:
+            meta = GstVideo.buffer_get_video_meta(buf)
+        except Exception:
+            meta = None
+        if meta is not None and meta.n_planes >= 2:
+            stride_y, stride_uv = int(meta.stride[0]), int(meta.stride[1])
+            off_y, off_uv = int(meta.offset[0]), int(meta.offset[1])
+        if off_uv is None:
+            # No meta. Fall back to the same 64-byte alignment guess sample_to_y
+            # makes, with the planes contiguous.
+            aligned = (w + 63) // 64 * 64
+            if len(mi.data) >= aligned * h * 3 // 2:
+                stride_y = stride_uv = aligned
+            off_y, off_uv = 0, stride_y * h
+        need = max(off_y + stride_y * h, off_uv + stride_uv * (h // 2))
+        if len(mi.data) < need or h % 2 or w % 2:
+            return None, None
+        y = np.frombuffer(
+            mi.data[off_y:off_y + stride_y * h], dtype=np.uint8
+        ).reshape(h, stride_y)
+        uv = np.frombuffer(
+            mi.data[off_uv:off_uv + stride_uv * (h // 2)], dtype=np.uint8
+        ).reshape(h // 2, stride_uv)
+        out = np.empty(w * h * 3 // 2, dtype=np.uint8)
+        out[:w * h].reshape(h, w)[:] = y[:, :w]
+        out[w * h:].reshape(h // 2, w)[:] = uv[:, :w]
+        return out.tobytes(), buf.pts
+    finally:
+        buf.unmap(mi)
+
+
 def sample_to_rgb(sample, w, h):
     buf = sample.get_buffer()
     ok, mi = buf.map(Gst.MapFlags.READ)
@@ -447,9 +517,19 @@ def _cloud_line(cloud):
     stats = cloud.stats()
     if not stats["config_ok"]:
         return f"UNREACHABLE({stats['last_error'] or 'connecting'})"
+    # Stills ride the same uplink and are worth saying even while the video
+    # stream is off, which is the normal state for taking one: without this the
+    # line reads a bare `off` while a 2 MB upload is in flight.
+    still = ""
+    if stats["capturing"]:
+        still = "+capturing"
+    elif stats["stills"] or stats["stills_failed"]:
+        still = f"+{stats['stills']}still"
+        if stats["stills_failed"]:
+            still += f"/{stats['stills_failed']}fail"
     if not stats["enabled"]:
-        return "off"
-    parts = [f"{stats['sent']}sent"]
+        return f"off{still}"
+    parts = [f"{stats['sent']}sent{still}"]
     if stats["dropped"]:
         parts.append(f"{stats['dropped']}drop")
     if stats["errors"]:
@@ -533,6 +613,25 @@ def main():
                          "stream on this board.")
     ap.add_argument("--engine", default="best_640x1280_b2_fp16.engine")
     ap.add_argument("--cls-engine", default="best-cls_fp16.engine")
+    ap.add_argument("--no-detect", action="store_true",
+                    help="do not load the YOLO engine at all: capture, previews, "
+                         "full-resolution stills, bearings and the lidar all run, "
+                         "and nothing is inferred. This is the mode for using the "
+                         "cameras as cameras -- photographing the AR tags on the "
+                         "dock, checking a lens, running on a board whose engines "
+                         "have not been rebuilt after a pull. THIS PROCESS OWNS "
+                         "BOTH SENSORS (Argus gives a CSI camera to one consumer), "
+                         "so a separate capture script is not an alternative. The "
+                         "dashboard can also switch inference off and on at "
+                         "runtime; this flag is the stronger form, and no remote "
+                         "toggle can turn it back on in this process.")
+    ap.add_argument("--net", default="1280x640",
+                    help="detector input size to assume when there is no engine "
+                         "to ask (--no-detect). Sets the crop's aspect and the "
+                         "preview geometry, so leaving it at the real detector's "
+                         "2:1 keeps a no-detect run framed exactly like a normal "
+                         "one. Ignored when an engine is loaded -- that always "
+                         "wins, since a mismatch would misplace every box.")
     ap.add_argument("--preview", default="640x320", help="preview WxH per camera")
     ap.add_argument("--quality", type=int, default=75)
     ap.add_argument("--conf", type=float, default=0.25)
@@ -671,16 +770,31 @@ def main():
     w, h, fps = SENSOR[args.mode]
     pw, ph = (int(v) for v in args.preview.split("x"))
 
-    det = Engine(args.engine)
-    b, _, net_h, net_w = det.in_shape
-    if b != 2:
-        print(f"detector engine is batch {b}; this app batches the two cameras "
-              f"together and needs batch 2", file=sys.stderr)
+    # The detector's input size decides the crop's aspect and the preview's, so it
+    # has to be known before the pipeline is built. With an engine it comes from
+    # the engine, always -- a mismatch there would misplace every box. Without
+    # one, --net stands in, defaulting to the real detector's 2:1 so a no-detect
+    # run is framed exactly like a normal one.
+    det = None
+    try:
+        net_w, net_h = (int(v) for v in args.net.lower().split("x"))
+    except ValueError:
+        print(f"--net wants WxH, got {args.net!r}", file=sys.stderr)
         return 2
-    print(f"detector {args.engine}: in {det.in_shape} out {det.out_shape}")
+    if args.no_detect:
+        print(f"detector OFF (--no-detect): no engine loaded, "
+              f"net geometry {net_w}x{net_h} from --net")
+    else:
+        det = Engine(args.engine)
+        b, _, net_h, net_w = det.in_shape
+        if b != 2:
+            print(f"detector engine is batch {b}; this app batches the two cameras "
+                  f"together and needs batch 2", file=sys.stderr)
+            return 2
+        print(f"detector {args.engine}: in {det.in_shape} out {det.out_shape}")
 
     cls = None
-    if not args.no_classify:
+    if det is not None and not args.no_classify:
         try:
             cls = Engine(args.cls_engine)
             print(f"classifier {args.cls_engine}: in {cls.in_shape} out {cls.out_shape}")
@@ -851,6 +965,7 @@ def main():
                   collections.deque(maxlen=max(0, args.lidar_frame_history))]
     fuse_ms = 0.0           # time in the fusion block, summed over the window
     fuse_n = 0
+    stills = 0              # full-resolution frames handed to the uplink
     frames = 0
     t_stats = time.monotonic()
     fps_meas = 0.0
@@ -908,9 +1023,19 @@ def main():
             # buoy on a different frame than the one that detected it, which for a
             # moving target is a silent bearing error. Cache a few and look up the
             # exact PTS, exactly as jpeg_cache already does for the preview.
+            # Has an operator asked for a full-resolution still? Read once per
+            # frame, because it decides whether the branch below keeps colour as
+            # well as luma. Cheap: a couple of comparisons on a dict the uplink
+            # thread owns.
+            want_still = cloud.wanted_still() if cloud is not None else None
+
             ys = [None, None]
-            if do_est:
+            nv12s = [None, None]
+            if do_est or want_still is not None:
                 for i in (0, 1):
+                    keep = (want_still is not None
+                            and str(i) in want_still["cameras"])
+                    newest = None
                     while True:
                         s = fulls[i].try_pull_sample(0)
                         if s is None:
@@ -918,26 +1043,82 @@ def main():
                         y_arr, y_pts = sample_to_y(s, w, h)
                         if y_arr is not None:
                             y_cache[i][y_pts] = y_arr
+                        if keep:
+                            # Hold the sample, do not convert yet: the loop is
+                            # draining a few buffers and only the last of them is
+                            # worth 7.5 MB of copying. A Gst.Sample owns its
+                            # buffer, so keeping one across further pulls is safe.
+                            newest = s
                     # Full frames are 5 MB each, so keep the window short.
                     if len(y_cache[i]) > 4:
                         for k in sorted(y_cache[i])[:-3]:
                             del y_cache[i][k]
-                    ys[i] = y_cache[i].pop(ptss[i], None)
-                    if ys[i] is None:
-                        y_stale[i] += 1
+                    if do_est:
+                        ys[i] = y_cache[i].pop(ptss[i], None)
+                        if ys[i] is None:
+                            y_stale[i] += 1
+                    else:
+                        # Nothing measures on these; they were only drained so the
+                        # still could have one. Do not let the cache grow.
+                        y_cache[i].clear()
+                    if newest is not None:
+                        nv12s[i], still_pts = sample_to_nv12(newest, w, h)
+                        if nv12s[i] is not None and cloud.submit_still(
+                            i, nv12s[i], w, h, clock.frame_time(still_pts),
+                            want_still,
+                            meta={
+                                # How the picture was made. Every one of these is
+                                # something a later marker or calibration fit has
+                                # to know and cannot recover from the pixels:
+                                # a calibration does not transfer across sensor
+                                # modes, and it is only valid for the ORIENTATION
+                                # it was captured in (see the rotated_180 warning
+                                # further up) -- a mismatch there fails silently.
+                                "mode": args.mode,
+                                "rotated_180": not args.no_rotate,
+                                "calib": (names[i] if cams[i] is not None else ""),
+                                "wb": args.wb,
+                                "saturation": args.saturation,
+                                # The whole sensor frame. Said explicitly because
+                                # every OTHER image this program emits is cropped,
+                                # and a consumer that assumed the usual crop would
+                                # get a plausible, wrong principal point.
+                                "crop": "none",
+                                "detect": "on" if det is not None else "off",
+                            },
+                        ):
+                            stills += 1
 
-            for i in (0, 1):
-                # Fused multiply into a preallocated buffer: the obvious
-                # astype()/255 form measured 17 ms per camera here, this one 3.5 ms.
-                np.multiply(rgbs[i].transpose(2, 0, 1), np.float32(1.0 / 255.0),
-                            out=blob[i])
-
-            out = det.infer(blob)[0]        # (2, 300, 6)
+            # Two switches, and they are not the same switch. `--no-detect` means
+            # no engine was ever loaded in this process; the dashboard's toggle
+            # means one was and inference is paused. Both land here, and what
+            # stops is only the inference: capture, previews, stills, the lidar
+            # and the frames on the wire all carry on, because tearing the
+            # pipeline down to stop inferring is what latches Argus.
+            detecting = det is not None and (cloud is None or cloud.detect)
+            if detecting:
+                for i in (0, 1):
+                    # Fused multiply into a preallocated buffer: the obvious
+                    # astype()/255 form measured 17 ms per camera here, this one
+                    # 3.5 ms.
+                    np.multiply(rgbs[i].transpose(2, 0, 1), np.float32(1.0 / 255.0),
+                                out=blob[i])
+                out = det.infer(blob)[0]        # (2, 300, 6)
+            else:
+                out = None
             now = time.time()
             frames += 1
 
             per_cam = []
             for i in (0, 1):
+                if out is None:
+                    # An empty list, not a missing key: a frame with the detector
+                    # off is a frame with nothing detected in it, and every
+                    # consumer already handles that. The alternative -- omitting
+                    # `dets` -- would make receiver.py and cloud_camera's overlay
+                    # each need a new case for a state that is not new.
+                    per_cam.append([])
+                    continue
                 rows = out[i]
                 keep = rows[rows[:, 4] >= args.conf]
                 ids = (trackers[i].update(keep[:, :4]) if trackers
@@ -1106,15 +1287,20 @@ def main():
                 fps_meas = frames / el
                 print(f"[{time.strftime('%H:%M:%S')}] {fps_meas:5.2f} fps/cam  "
                       f"sent={tx.sent} dropped={tx.dropped} "
-                      f"cardinals={cards} "
-                      f"stale_full={y_stale[0]}/{y_stale[1]} "
+                      # Said every window rather than only at start-up: the
+                      # dashboard can turn this off mid-run, and "why are there
+                      # no boxes" is otherwise a long hunt.
+                      + ("detect=OFF " if not detecting else "")
+                      + f"cardinals={cards} "
+                      + (f"stills={stills} " if stills else "")
+                      + f"stale_full={y_stale[0]}/{y_stale[1]} "
                       f"est_err={est_err[0]} "
                       f"link={'up' if tx.connected else 'DOWN'}"
                       + (f"  lidar={_lidar_line(reader, lidar_lit, lidar_stale, lidar_self, lidar_skew, fuse_ms / max(fuse_n, 1))}"
                          if reader else "")
                       + (f"  cloud={_cloud_line(cloud)}" if cloud else ""),
                       flush=True)
-                frames, cards = 0, 0
+                frames, cards, stills = 0, 0, 0
                 fuse_ms, fuse_n = 0.0, 0
                 t_stats = time.monotonic()
     except KeyboardInterrupt:
@@ -1134,7 +1320,8 @@ def main():
             reader.join(timeout=3.0)
         if cloud is not None:
             cloud.close()
-        det.close()
+        if det is not None:
+            det.close()
         if cls is not None:
             cls.close()
     return 0

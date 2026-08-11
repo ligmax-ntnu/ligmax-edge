@@ -124,6 +124,14 @@ STILL_QUEUE = 4
 MAX_WIDTH = 1280
 MAX_FPS = 10.0
 
+# What this build can do, sent on every request so the dashboard can tell a board
+# running old code from a board that is switched off. Without it those two are the
+# same thing seen from shore: a Jetson that predates a feature polls perfectly,
+# ignores the new field on the reply, and answers nothing - and the panel would
+# have to blame the network. Add a name here when a capability is added; never
+# rename one, because the server tests for the exact string.
+CAPS = "still"
+
 # Deliberately the same values as receiver.py's COLOURS, keyed by detector class.
 # The bench viewer and the dashboard show the same scene, and a buoy that is green
 # on one screen and yellow on the other costs more confusion than the duplication
@@ -739,6 +747,10 @@ class CameraUplink:
             "width": out_w,
             "height": out_h,
             "label": f"cam{camera}",
+            # On the frame POST as well as the config poll: while video is
+            # streaming this is the request that happens hundreds of times a
+            # minute and the poll is the one that stops.
+            "caps": CAPS,
         })
         path = f"{self.base_path}/api/camera?{query}"
         headers = self._headers(**{"Content-Type": "image/jpeg"})
@@ -782,7 +794,7 @@ class CameraUplink:
             return
         try:
             connection.request(
-                "GET", f"{self.base_path}/api/camera/config",
+                "GET", f"{self.base_path}/api/camera/config?caps={CAPS}",
                 headers=self._headers())
             response = connection.getresponse()
             body = response.read()

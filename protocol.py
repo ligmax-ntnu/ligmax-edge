@@ -44,9 +44,22 @@ Header fields (KIND_FRAME):
                         the remainder (fusion.ccm_strength_for): a full matrix on
                         top of a boosted frame clips about half of it. Absent on
                         senders older than this field -- treat that as 1.0.
+    preview_source str  which frame the JPEG is of: "crop" (the detector's 2:1
+                        band, the default and what every sender before
+                        --preview-full emitted) or "full" (the whole sensor
+                        frame). It decides how a full-frame pixel maps into the
+                        preview, so anything drawing tag outlines must read it.
+                        Absent on older senders -- treat that as "crop".
     jpeg_bytes   int    payload length
     fps          float  sender's measured rate, for display
     dets         list   see below
+    tags         list   the dock's AR tags, see below. PRESENT ONLY WHEN THE
+                        SENDER IS LOOKING FOR THEM -- absent, not empty, when
+                        --artags is off or cv2.aruco is missing on that board.
+                        The distinction is the point: [] means "looked and the
+                        berth is not in view", absent means "nothing on this
+                        boat is looking", and during the docking task those call
+                        for opposite reactions from the operator.
 
 Each detection carries, beyond {id, cls, name, conf, box, card, card_conf}:
 
@@ -115,6 +128,60 @@ of magnitude (+-3 cm flat, against +-5 % at 10 m rising as z**2):
                  wrong thing announces itself.
     bearing_deg  azimuth in the RIG frame, not the camera frame
     cam          which camera's box this was matched against
+
+AR tags (`tags` on a KIND_FRAME)
+--------------------------------
+NJORD §9.3 marks the assigned berth with three 18 x 18 cm markers, and with both
+lidars down they are the docking task's only sensor. One entry per tag seen in
+THIS camera's frame (`artags.py`):
+
+    id             int    the marker's id in the dictionary. Dock furniture:
+                          which berth and which side is `ligmax-pi`'s to decide
+    cam            int    0 or 1, repeated here because a consumer that merges
+                          both cameras' lists needs it after the merge
+    corners        list   four [u, v] in FULL SENSOR pixels, in the detector's
+                          order (top-left, top-right, bottom-right, bottom-left
+                          as the marker is printed). Full-frame, NOT preview and
+                          NOT detector-input pixels: the tags are outside the
+                          detector's crop and the fisheye model is fitted to the
+                          whole frame, so this is the only space they exist in
+    centre_px      list   [u, v], the corners' mean. For drawing, not measuring
+    edge_px        float  shortest projected edge. The resolution figure: ~53 px
+                          at 3 m, ~20 px at 8 m, and range error scales as 1/this
+    pos_rig        list   [x, y, z] m in the RIG frame -- +x starboard, +y DOWN,
+                          +z forward, origin at the front lidar. The same frame
+                          the point cloud ships in
+    range_m        float  |pos_rig|
+    sigma_m        float  its uncertainty, from corner repeatability and the
+                          print's own tolerance
+    bearing_deg    float  azimuth in the RIG frame, 0 dead ahead, + to starboard.
+                          NOT a camera-frame angle, unlike a detection's
+    elevation_deg  float  positive up, rig frame
+    normal_rig     list   unit vector out of the tag's face, rig frame
+    facing_deg     float  that normal as a rig bearing
+    incidence_deg  float  angle between the face and the line of sight; 0 is
+                          square on
+    ambiguity      float  ratio of the two planar-pose solutions' errors, or null
+    reproj_px      float  the chosen solution's residual
+
+**Positions are trustworthy and rotations are not.** Round-tripped through exact
+synthetic corners, `pos_rig` comes back to 0.09 deg of bearing and 3 mm of range
+anywhere in the working envelope, while `normal_rig` is out by 28 deg at 15 deg of
+tag tilt and 49 deg at 25 deg -- the mirrored planar solution, which fits the
+corners just as well. `ambiguity` was 0.01 for all of those, so it does not catch
+it. A value near 1.0 proves the normal is worthless; a low value proves nothing.
+
+So: **build a berth's geometry out of two tags' positions, never out of one tag's
+normal.** Two tags 2 m apart, each placed to 5 cm, fix the line between them to
+about 1.5 deg. `artags.py`'s docstring has the full table.
+
+One more thing that decides how these have to be used: each camera's 88 deg cone
+reaches only ~12 deg past the bow (cam0 covers rig bearings -162..+12, cam1
+-12..+162). A 2 m berth seen from 1 m has its two sides at +-45 deg, so its tags
+land **one in each camera** and a berth is assembled across the pair. What holds
+the two halves in register is `rig.json`'s hand-described, unverified +-75 deg
+camera yaws -- see `artags.TagFinder.bench_check`, and note that a berth mouth
+measuring wrong is that same error showing itself while the boat works.
 
 Lidar messages (KIND_LIDAR)
 ---------------------------

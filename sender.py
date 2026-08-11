@@ -101,6 +101,7 @@ gi.require_version("GstApp", "1.0")
 gi.require_version("GstVideo", "1.0")
 from gi.repository import GLib, Gst, GstApp, GstVideo  # noqa: E402,F401
 
+import artags
 import estimate
 import fusion
 import lidar as lidar_mod
@@ -266,10 +267,24 @@ def build_pipeline(args, w, h, fps, crops, net_w, net_h, pw, ph):
             f"! nvvideoconvert compute-hw=GPU "
             f"! video/x-raw,format=RGB,width={net_w},height={net_h} "
             f"! appsink name=det{sid} emit-signals=false max-buffers=2 drop=true sync=false "
-            # preview branch: downscale the cropped frame, then hardware JPEG. Same
-            # crop as the detector, so boxes overlay with one uniform scale.
-            f"t{sid}. ! queue max-size-buffers=2 leaky=downstream "
-            f"! nvvideoconvert ! video/x-raw(memory:NVMM),width={pw},height={ph},format=I420 "
+            # preview branch: downscale, then hardware JPEG.
+            #
+            # Off the CROPPED tee by default, so the preview is framed exactly like
+            # the detector and a box overlays with one uniform scale.
+            #
+            # Off the FULL tee under --preview-full, because the docking task needs
+            # the opposite thing: the AR tags are ~75 deg off each lens's axis and
+            # the 2:1 detector band does not contain them, so a preview of the crop
+            # is a live picture of the wrong part of the lens. This branch adds no
+            # src-crop of its own -- the segfault described above is two CROPPERS
+            # racing on one tee'd surface, and a plain scale is not a second
+            # cropper -- but it is a change to a pipeline that is known to be
+            # delicate on this board, so it is opt-in and the run falls back by
+            # dropping the flag.
+            + (f"a{sid}. ! queue max-size-buffers=2 leaky=downstream "
+               if args.preview_full else
+               f"t{sid}. ! queue max-size-buffers=2 leaky=downstream ")
+            + f"! nvvideoconvert ! video/x-raw(memory:NVMM),width={pw},height={ph},format=I420 "
             f"! nvjpegenc quality={args.quality} "
             f"! appsink name=jpg{sid} emit-signals=false max-buffers=3 drop=true sync=false"
         )
@@ -633,6 +648,18 @@ def main():
                          "one. Ignored when an engine is loaded -- that always "
                          "wins, since a mismatch would misplace every box.")
     ap.add_argument("--preview", default="640x320", help="preview WxH per camera")
+    ap.add_argument("--preview-full", action="store_true",
+                    help="make the preview JPEG the WHOLE sensor frame instead of "
+                         "the detector's 2:1 band. This is what the docking page "
+                         "needs: the AR tags sit ~75 deg off each lens's axis, "
+                         "outside the crop, so the ordinary preview is a live "
+                         "picture of the wrong part of the lens. The height is "
+                         "re-derived from --preview's width to keep 4:3. Detector "
+                         "boxes still overlay correctly (the header carries `crop` "
+                         "and `preview_source`), but this moves the preview onto "
+                         "the full-resolution tee, and this pipeline has a known "
+                         "segfault involving tees -- see build_pipeline. Opt-in for "
+                         "that reason; drop the flag to get the old framing back.")
     ap.add_argument("--quality", type=int, default=75)
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--crop-top", type=int, default=None,
@@ -658,6 +685,51 @@ def main():
                          "branch that feeds it")
     ap.add_argument("--buoy-diameter", type=float, default=0.40,
                     help="buoy diameter in metres; 0.40 for Njord competition marks")
+    ap.add_argument("--artags", action="store_true",
+                    help="find the dock's AR tags (NJORD §9.3) in the FULL sensor "
+                         "frame and ship their boat-relative geometry as `tags`. "
+                         "This is the docking task's only sensor now that both "
+                         "lidars are down: three 18 cm tags mark the assigned "
+                         "berth, and ligmax-pi builds the berth out of them. Needs "
+                         "a calibration and rig.json, and needs cv2.aruco in the "
+                         "OpenCV on this board -- all three are checked at start-up "
+                         "and reported rather than discovered mid-run. Costs one "
+                         "detectMarkers over about a third of each frame; runs "
+                         "happily with --no-detect and --no-lidar, which is the "
+                         "docking configuration.")
+    ap.add_argument("--artag-size", type=float, default=artags.TAG_M,
+                    help="the tags' BLACK SQUARE edge in metres (default 0.18, per "
+                         "the handbook). Every range scales linearly with this, so "
+                         "measure the print rather than trusting the printer: A4 at "
+                         "'fit to page' comes out a few per cent small.")
+    ap.add_argument("--artag-dict", default=artags.DICT_NAME,
+                    help="ArUco dictionary. The organisers' own files decode as ids "
+                         "0-7 in DICT_4X4_50, which is the smallest that holds them "
+                         "and so the most false-positive-resistant.")
+    ap.add_argument("--artag-window", type=float, default=artags.WINDOW_DEG,
+                    help="half-width in degrees of the forward arc searched for "
+                         "tags. The tags are on a dock ahead; cropping to that is "
+                         "most of what makes this affordable on a 5 Mpx frame.")
+    ap.add_argument("--artag-min-px", type=float, default=artags.MIN_EDGE_PX,
+                    help="smallest tag edge in pixels worth reporting. An 18 cm tag "
+                         "is ~53 px at 3 m and ~20 px at 8 m on this rig.")
+    ap.add_argument("--artag-every", type=int, default=1,
+                    help="run the tag search every Nth frame. 1 (the default) is "
+                         "every frame, which is what has been measured: ~80 ms per "
+                         "camera on a cluttered scene, so ~160 ms a frame pair and "
+                         "capture drops to 6 fps or so. That is ample for a 0.3 m/s "
+                         "creep, and the pipeline drops frames rather than blocking, "
+                         "so it costs rate and not stability. Raise this to 2 or 3 "
+                         "if the frame rate matters more than the tag rate -- it is "
+                         "the cheapest lever there is.")
+    ap.add_argument("--artag-bench", action="store_true",
+                    help="print what the two cameras disagree by about every tag "
+                         "they can both see. rig.json's camera yaws are hand-"
+                         "described and UNVERIFIED, and they are what holds one "
+                         "camera's half of a berth in register with the other's; "
+                         "the pair overlaps ~24 deg across the bow, so a tag placed "
+                         "dead ahead is measured twice and the difference is the "
+                         "yaw error. Bench use -- it prints every frame.")
     ap.add_argument("--readout-frac", type=float, default=0.9,
                     help="fraction of the frame period the rolling shutter spends "
                          "reading active rows, used for the per-detection timestamp. "
@@ -769,6 +841,14 @@ def main():
 
     w, h, fps = SENSOR[args.mode]
     pw, ph = (int(v) for v in args.preview.split("x"))
+    if args.preview_full:
+        # --preview lives at the detector's 2:1, and the full sensor frame is 4:3.
+        # Keeping the requested WIDTH and re-deriving the height is what stops a
+        # full-frame preview arriving squashed; the width is what the 4G uplink and
+        # the dashboard's panel actually care about.
+        ph = 2 * int(round(0.5 * pw * h / w))
+        print(f"preview is the WHOLE sensor frame, {pw}x{ph} "
+              f"(--preview-full): the AR tags are outside the detector's band")
 
     # The detector's input size decides the crop's aspect and the preview's, so it
     # has to be known before the pipeline is built. With an engine it comes from
@@ -884,8 +964,13 @@ def main():
     # intrinsics: rig.json says where the sensors are relative to each other, the
     # cam*.json fits say what each lens does. Both are needed to put a return on a
     # pixel, so a missing rig file disables colour but not capture.
+    # Loaded for the tags as well as the lidar, and therefore NOT behind
+    # --no-lidar: with both lidars down, the docking configuration is
+    # `--artags --no-lidar --no-detect`, and that run needs the camera poses more
+    # than any other. rig.json holds both sets of geometry and only the lidar half
+    # of it is the known-stale one.
     rig, reader = None, None
-    if not args.no_lidar:
+    if not args.no_lidar or args.artags:
         try:
             rig = fusion.Rig.load(args.rig)
             if args.lidar_self_box:
@@ -896,8 +981,31 @@ def main():
         except OSError as e:
             print(f"[warn] no rig geometry ({e}); the sweep will ship uncoloured "
                   f"and detections get no lidar range", file=sys.stderr)
+    if not args.no_lidar:
         reader = lidar_mod.LidarReader(args.lidar_port)
         reader.start()      # connects on its own thread; never blocks capture
+
+    # The dock's AR tags. Constructed up front and loudly, because every way this
+    # can fail is a start-up fact -- no cv2.aruco in this OpenCV, no calibration,
+    # no rig -- and the alternative is finding out on the water that the one
+    # sensor the docking task has was never running.
+    finder = None
+    if args.artags:
+        try:
+            finder = artags.TagFinder(
+                cams, rig,
+                tag_m=args.artag_size, dict_name=args.artag_dict,
+                window_deg=args.artag_window, min_edge_px=args.artag_min_px,
+            )
+            print(f"AR tags on:\n{finder.describe()}")
+        except artags.TagError as e:
+            print(f"[warn] AR tags OFF: {e}", file=sys.stderr)
+            print("[warn] the docking task has no other sensor -- fix this before "
+                  "the run", file=sys.stderr)
+    # Tags are measured on the FULL sensor frame, so they need the same
+    # full-resolution branch the bearings do -- and they need it even under
+    # --no-estimate, which is why this is its own flag and not folded into do_est.
+    want_tags = finder is not None
 
     Gst.init(None)
     desc = build_pipeline(args, w, h, fps, crops, net_w, net_h, pw, ph)
@@ -965,6 +1073,9 @@ def main():
                   collections.deque(maxlen=max(0, args.lidar_frame_history))]
     fuse_ms = 0.0           # time in the fusion block, summed over the window
     fuse_n = 0
+    tag_ms = 0.0            # and in the AR-tag block, the docking task's sensor
+    tag_n = 0
+    last_tags = [[], []]    # re-sent on a frame the tag search skipped
     stills = 0              # full-resolution frames handed to the uplink
     frames = 0
     t_stats = time.monotonic()
@@ -1031,7 +1142,7 @@ def main():
 
             ys = [None, None]
             nv12s = [None, None]
-            if do_est or want_still is not None:
+            if do_est or want_tags or want_still is not None:
                 for i in (0, 1):
                     keep = (want_still is not None
                             and str(i) in want_still["cameras"])
@@ -1053,7 +1164,7 @@ def main():
                     if len(y_cache[i]) > 4:
                         for k in sorted(y_cache[i])[:-3]:
                             del y_cache[i][k]
-                    if do_est:
+                    if do_est or want_tags:
                         ys[i] = y_cache[i].pop(ptss[i], None)
                         if ys[i] is None:
                             y_stale[i] += 1
@@ -1088,6 +1199,42 @@ def main():
                             },
                         ):
                             stills += 1
+
+            # ---- the dock's AR tags, on the FULL frame, before inference.
+            #
+            # Before, because with both lidars down this is the docking task's only
+            # sensor and it must not be the thing that gets skipped when the
+            # detector has a slow frame. It reads `ys[i]`, the full-resolution luma
+            # plane already matched to this frame by PTS for the bearing
+            # refinement, so it costs no extra capture and measures the same
+            # instant everything else on this frame does.
+            per_cam_tags = [[], []]
+            if finder is not None and frames % max(1, args.artag_every) == 0:
+                t_tag0 = time.perf_counter()
+                for i in (0, 1):
+                    if ys[i] is None:
+                        continue
+                    per_cam_tags[i] = finder.find(i, ys[i])
+                last_tags = per_cam_tags
+                tag_ms += 1000.0 * (time.perf_counter() - t_tag0)
+                tag_n += 1
+                if args.artag_bench:
+                    both = per_cam_tags[0] + per_cam_tags[1]
+                    for row in finder.bench_check(both):
+                        print(f"[bench] tag {row['id']}: cam0 "
+                              f"{row['cam0_bearing_deg']:+.2f} deg / "
+                              f"{row['cam0_range_m']:.3f} m, cam1 "
+                              f"{row['cam1_bearing_deg']:+.2f} deg / "
+                              f"{row['cam1_range_m']:.3f} m -> yaw error "
+                              f"{row['bearing_error_deg']:+.2f} deg, range "
+                              f"differs {row['range_error_m']:+.3f} m")
+
+            elif finder is not None:
+                # A SKIPPED frame re-sends the last sighting rather than an empty
+                # list. `tags: []` on the wire means "looked, and the berth is not in
+                # view", and the Pi ages tags out at 1 s - so sending [] here would
+                # tell it the berth had vanished on every other frame.
+                per_cam_tags = last_tags
 
             # Two switches, and they are not the same switch. `--no-detect` means
             # no engine was ever loaded in this process; the dashboard's toggle
@@ -1245,6 +1392,12 @@ def main():
                     "jpeg_w": pw, "jpeg_h": ph,
                     "crop": list(crops[i]),
                     "full_w": w, "full_h": h,
+                    # WHICH frame the preview JPEG is of, because since
+                    # --preview-full there are two answers and a consumer that
+                    # assumes the old one draws every box and every tag outline in
+                    # the wrong place. "crop" scales net->jpeg directly; "full"
+                    # goes net->full through `crop` first. See protocol.py.
+                    "preview_source": "full" if args.preview_full else "crop",
                     "refined": ys[i] is not None,
                     # How much chroma the ISP already applied, so a viewer knows
                     # how much of the OV5647 matrix is left to apply and cannot
@@ -1254,6 +1407,13 @@ def main():
                     "saturation": args.saturation,
                     "fps": round(fps_meas, 2),
                     "dets": items,
+                    # The dock's AR tags, in the RIG frame, measured on the full
+                    # sensor frame. Omitted entirely rather than sent as [] when
+                    # tags are off, so the Pi can tell "looked and saw none" from
+                    # "this build is not looking" -- the same distinction the
+                    # dashboard's `caps` exists for, and the one that otherwise
+                    # reads as a broken sensor. See protocol.py.
+                    **({"tags": per_cam_tags[i]} if finder is not None else {}),
                 }, jpeg)
 
                 # Offer the same preview to the dashboard. It rate-limits and
@@ -1269,7 +1429,17 @@ def main():
                 # and draws in its worker thread.
                 if cloud is not None:
                     cloud.submit(i, jpeg, pw, ph, t_cap,
-                                 dets=items, det_size=(net_w, net_h))
+                                 dets=items, det_size=(net_w, net_h),
+                                 # The tags go to shore as OUTLINES ON THE PICTURE,
+                                 # and their geometry goes to the Pi. Same split as
+                                 # the detections, for the same reason: the
+                                 # dashboard has no channel for either beside the
+                                 # JPEG, and the /dock page's whole job is showing
+                                 # an operator what the boat has hold of.
+                                 tags=per_cam_tags[i],
+                                 tag_frame=(w, h,
+                                            "full" if args.preview_full else "crop",
+                                            crops[i]))
 
             # The sweep goes as its own message rather than riding on a camera
             # frame: it belongs to neither camera (most of a rotation is behind
@@ -1298,10 +1468,13 @@ def main():
                       f"link={'up' if tx.connected else 'DOWN'}"
                       + (f"  lidar={_lidar_line(reader, lidar_lit, lidar_stale, lidar_self, lidar_skew, fuse_ms / max(fuse_n, 1))}"
                          if reader else "")
+                      + (f"  {artags.stats_line(per_cam_tags[0] + per_cam_tags[1], finder)}"
+                         f" {tag_ms / max(tag_n, 1):.1f}ms" if finder else "")
                       + (f"  cloud={_cloud_line(cloud)}" if cloud else ""),
                       flush=True)
                 frames, cards, stills = 0, 0, 0
                 fuse_ms, fuse_n = 0.0, 0
+                tag_ms, tag_n = 0.0, 0
                 t_stats = time.monotonic()
     except KeyboardInterrupt:
         print("\nstopping")

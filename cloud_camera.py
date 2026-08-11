@@ -130,7 +130,11 @@ MAX_FPS = 10.0
 # ignores the new field on the reply, and answers nothing - and the panel would
 # have to blame the network. Add a name here when a capability is added; never
 # rename one, because the server tests for the exact string.
-CAPS = "still"
+#
+# `artag` means this build can find the dock's markers -- not that it is looking.
+# Whether it is depends on --artags and on cv2.aruco existing here, which is why
+# the frame header carries `tags` only when it really is searching.
+CAPS = "still,artag"
 
 # Deliberately the same values as receiver.py's COLOURS, keyed by detector class.
 # The bench viewer and the dashboard show the same scene, and a buoy that is green
@@ -139,6 +143,11 @@ CAPS = "still"
 # *viewer* host and importing it would drag its HTTP server onto the Jetson.
 BOX_COLOURS = {0: (60, 220, 90), 1: (240, 70, 70), 2: (250, 200, 40)}
 BOX_FALLBACK = (200, 200, 200)
+
+# AR tags. Deliberately a colour no buoy class uses: on a docking run the tags and
+# the marks can be in one frame, and "which of these outlines is the berth" has to
+# be answerable at a glance on a 480 px tile.
+TAG_COLOUR = (235, 100, 235)
 
 try:
     from PIL import Image, ImageDraw
@@ -261,8 +270,9 @@ class CameraUplink:
         return bool(self.stream.get("detect", True))
 
     def submit(self, cam, jpeg: bytes, width: int, height: int,
-               t_capture: float | None = None, dets=None, det_size=None) -> None:
-        """Offer a preview JPEG, and the boxes to burn into it. Never blocks.
+               t_capture: float | None = None, dets=None, det_size=None,
+               tags=None, tag_frame=None) -> None:
+        """Offer a preview JPEG, and what to burn into it. Never blocks.
 
         Cheap to call while the stream is off, which is why it can sit
         unconditionally in the capture loop.
@@ -272,6 +282,14 @@ class CameraUplink:
         into fractions of the frame here and drawn in the worker thread - see
         `_overlay`. Nothing is copied or converted until after the rate gate below,
         so a frame that is about to be dropped costs nothing extra.
+
+        `tags` is `artags.TagFinder.find`'s output and `tag_frame` is
+        `(full_w, full_h, preview_source, crop)` - everything needed to say where a
+        FULL-SENSOR-FRAME pixel lands in this preview. Tag corners are in full-frame
+        pixels because that is the only frame they can be measured in, and the
+        preview is either the whole frame or the detector's band, so the mapping is
+        not one constant. Getting it from the caller rather than assuming is what
+        stops a tag outline appearing 700 px from the tag.
         """
         if self._closed or not jpeg:
             return
@@ -298,6 +316,11 @@ class CameraUplink:
         # iteration, and holding a reference across the queue would mean reading it
         # while the next frame is being built.
         boxes = self._normalise(dets, det_size) if self.draw_boxes else ()
+        # Tag outlines are NOT behind --no-cloud-boxes. That flag exists to judge
+        # the camera without the detector's opinion drawn over it; a tag outline is
+        # not an opinion, it is the docking task's only sensor saying what it has
+        # hold of, and it is the one thing the /dock page's picture is for.
+        marks = self._normalise_tags(tags, tag_frame) if ImageDraw is not None else ()
 
         with self._lock:
             if camera in self._pending:
@@ -306,7 +329,7 @@ class CameraUplink:
                 # operator should ask for less.
                 self.dropped += 1
             self._pending[camera] = (jpeg, width, height,
-                                     t_capture or time.time(), boxes)
+                                     t_capture or time.time(), boxes, marks)
         self._wake.set()
 
     @staticmethod
@@ -337,6 +360,50 @@ class CameraUplink:
                 label = f"{det['card']} {label}"
             out.append((box[0] / net_w, box[1] / net_h,
                         box[2] / net_w, box[3] / net_h, colour, label))
+        return tuple(out)
+
+    @staticmethod
+    def _normalise_tags(tags, tag_frame) -> tuple:
+        """AR tags -> `(points, colour, label)`, points in 0..1 fractions.
+
+        The same fraction-space reasoning as `_normalise`: the server owns the
+        output width. What differs is the input space. A tag's corners are measured
+        on the WHOLE sensor frame - that is the only image the fisheye calibration
+        applies to and the only one the tags are inside - while the preview is
+        either that same whole frame (`--preview-full`) or the detector's 2:1 band.
+        So the mapping comes from `preview_source`, not from an assumption.
+
+        A tag whose centre falls outside the preview is dropped rather than clamped.
+        With the ordinary cropped preview that is *most* tags, which is the honest
+        picture: the crop is aimed 75 deg away from them, and an outline pinned to
+        the frame edge would suggest the boat is looking at something it is not.
+        """
+        if not tags or not tag_frame:
+            return ()
+        full_w, full_h, source, crop = tag_frame
+        if source == "full":
+            ox, oy, sw, sh = 0.0, 0.0, float(full_w), float(full_h)
+        else:
+            cl, ct, cw, ch = crop
+            ox, oy, sw, sh = float(cl), float(ct), float(cw), float(ch)
+        if sw <= 0 or sh <= 0:
+            return ()
+        out = []
+        for tag in tags:
+            corners = tag.get("corners") or ()
+            if len(corners) != 4:
+                continue
+            pts = tuple(((u - ox) / sw, (v - oy) / sh) for u, v in corners)
+            cx = sum(p[0] for p in pts) / 4.0
+            cy = sum(p[1] for p in pts) / 4.0
+            if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0):
+                continue
+            # Range and bearing rather than the id alone: the id says which corner
+            # of the dock this is, and those two say whether the measurement is any
+            # good, which is what somebody watching a docking run needs to judge.
+            label = (f"#{tag.get('id')} {tag.get('range_m', 0.0):.1f}m "
+                     f"{tag.get('bearing_deg', 0.0):+.0f}°")
+            out.append((pts, TAG_COLOUR, label))
         return tuple(out)
 
     # -- full-resolution stills --------------------------------------------
@@ -477,8 +544,8 @@ class CameraUplink:
             if not pending and not stills:
                 self._wake.wait(IDLE_TICK)
 
-    def _encode(self, jpeg: bytes, width: int, height: int, boxes=()):
-        """Downscale, draw the boxes, and re-encode to what the server asked for.
+    def _encode(self, jpeg: bytes, width: int, height: int, boxes=(), marks=()):
+        """Downscale, draw the overlays, and re-encode to what the server asked for.
 
         The Jetson's preview branch already produced a JPEG on the hardware
         encoder, but at the pipeline's own size and quality (`--preview`,
@@ -502,10 +569,10 @@ class CameraUplink:
                       "dashboard asks for", flush=True)
             return jpeg, width, height
 
-        if width and width <= target and not boxes:
+        if width and width <= target and not boxes and not marks:
             # Already small enough, and nothing to draw on it. Re-encoding it
-            # would only lose quality. With boxes there is no such shortcut - they
-            # have to be burned in, so the decode happens either way.
+            # would only lose quality. With something to burn in there is no such
+            # shortcut - the decode happens either way.
             return jpeg, width, height
 
         try:
@@ -517,13 +584,13 @@ class CameraUplink:
                 # BILINEAR, not LANCZOS: this is a 480 px preview on a phone-sized
                 # panel and the sharper filter costs more than it shows.
                 image = image.resize(size, Image.BILINEAR)
-            if boxes:
+            if boxes or marks:
                 # After the resize, never before: drawing at 640x320 and then
                 # scaling down would thin the 2 px outlines to something under a
                 # pixel and resample the labels into mush. This way every stroke is
                 # laid down at the size it will be viewed at, and the drawing cost
                 # is set by the output tile rather than the source frame.
-                image = self._overlay(image, boxes)
+                image = self._overlay(image, boxes, marks)
             out = io.BytesIO()
             image.save(out, format="JPEG", quality=quality, optimize=False)
             return out.getvalue(), image.width, image.height
@@ -684,8 +751,10 @@ class CameraUplink:
                 self.capture = None
 
     @staticmethod
-    def _overlay(image, boxes):
-        """Draw the fraction-space boxes onto `image`. Returns the image to encode.
+    def _overlay(image, boxes, marks=()):
+        """Draw the fraction-space boxes and tag outlines onto `image`.
+
+        Returns the image to encode.
 
         Costs ~1 ms for a handful of boxes on a 480x240 tile, in the uplink's own
         worker thread and at the stream's 2 fps - so it is off the capture loop
@@ -715,6 +784,24 @@ class CameraUplink:
             tx = min(px1, max(0.0, w - tw - 4))
             draw.rectangle([tx, ty, tx + tw + 4, ty + 11], fill=colour)
             draw.text((tx + 2, ty), label, fill=(0, 0, 0))
+        # Tags last, so an outline is never hidden under a detector box: on a
+        # docking run the tag is the thing being steered by.
+        for points, colour, label in marks:
+            pts = [(x * w, y * h) for x, y in points]
+            # The real quadrilateral, not its bounding box. A tag 75 deg off the
+            # lens axis is a trapezium on the sensor, and drawing the box round it
+            # would hide exactly the foreshortening an operator needs to see to
+            # judge whether the boat is square to the berth.
+            draw.line(pts + pts[:1], fill=colour, width=width, joint="curve")
+            if not label:
+                continue
+            tw = draw.textlength(label)
+            top = min(p[1] for p in pts)
+            left = min(p[0] for p in pts)
+            ty = top - 11 if top >= 11 else min(max(p[1] for p in pts), h - 11)
+            tx = min(left, max(0.0, w - tw - 4))
+            draw.rectangle([tx, ty, tx + tw + 4, ty + 11], fill=colour)
+            draw.text((tx + 2, ty), label, fill=(0, 0, 0))
         return image
 
     def _headers(self, **extra: str) -> dict:
@@ -739,8 +826,8 @@ class CameraUplink:
         return headers
 
     def _post(self, camera: str, jpeg: bytes, width: int, height: int,
-              t_capture: float, boxes=()) -> None:
-        payload, out_w, out_h = self._encode(jpeg, width, height, boxes)
+              t_capture: float, boxes=(), marks=()) -> None:
+        payload, out_w, out_h = self._encode(jpeg, width, height, boxes, marks)
         query = urllib.parse.urlencode({
             "cam": camera,
             "t": f"{t_capture:.3f}",

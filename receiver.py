@@ -50,7 +50,11 @@ except ImportError:
 import protocol
 
 # Colours per detector class, plus a fallback.
-COLOURS = {0: (60, 220, 90), 1: (240, 70, 70), 2: (250, 200, 40)}
+# 3 is `vessel` -- the collision-avoidance detector's only class, from a second
+# engine (sender.py --vessel-engine). Magenta because nothing on the Njord course
+# is magenta: a vessel must never be mistaken at a glance for a red or green mark.
+COLOURS = {0: (60, 220, 90), 1: (240, 70, 70), 2: (250, 200, 40),
+           3: (235, 60, 235)}
 FALLBACK = (200, 200, 200)
 
 _TABLES = {}

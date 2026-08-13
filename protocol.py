@@ -268,11 +268,32 @@ _HDR = struct.Struct(">4sI")
 KIND_FRAME = "frame"
 KIND_LIDAR = "lidar"
 
-CLASS_NAMES = {0: "green", 1: "red", 2: "cardinal"}
+CLASS_NAMES = {0: "green", 1: "red", 2: "cardinal", 3: "vessel"}
 CARDINAL_NAMES = {0: "east", 1: "north", 2: "south", 3: "west"}
 
 # The detector class index that gets a second-stage cardinal classification.
 CARDINAL_CLASS_ID = 2
+
+# Class 3 does NOT come out of the buoy engine. It is the collision-avoidance
+# detector (NJORD 9.2, the Otter), which is a SEPARATE engine run over the same
+# blob -- see sender.py's --vessel-engine. Nothing forces one network to find
+# both a 40 cm buoy and a 2 m hull, and nothing on the course needs them at the
+# same time.
+#
+# It is appended to this table rather than given a wire format of its own so that
+# every consumer already handles it: the receiver draws it, the Pi's
+# `absorb_detections` reads `cls`, and a build with no vessel engine simply never
+# emits a 3. A consumer that does not know the class ignores it, which is why the
+# numbering is appended and nothing above is renumbered.
+VESSEL_CLASS_ID = 3
+
+# NJORD 9.2: the Otter is 2.0 x 1.08 m. `estimate.py` turns an apparent width
+# into a range and needs to be told how wide the thing is, and 1.08 -- the BEAM,
+# not the length -- is the deliberate choice: the boat cannot know the Otter's
+# aspect, and assuming the narrow figure makes the range an UNDER-estimate, so a
+# vessel is treated as nearer than it is and the give-way manoeuvre starts early.
+# The other way round is a boat that thinks it has room it does not have.
+OTTER_BEAM_M = 1.08
 
 
 def encode(header: dict, jpeg: bytes) -> bytes:

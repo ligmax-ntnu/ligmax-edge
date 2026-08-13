@@ -134,7 +134,13 @@ MAX_FPS = 10.0
 # `artag` means this build can find the dock's markers -- not that it is looking.
 # Whether it is depends on --artags and on cv2.aruco existing here, which is why
 # the frame header carries `tags` only when it really is searching.
-CAPS = "still,artag"
+# `colour` means this build has the hue-based mark finder (`colour_marks.py`) -- not
+# that it is running it, which depends on --colour-marks, on cv2, and on a
+# calibration existing for each camera. /surprise_task tests for it so that "the
+# Jetson has no colour mode" and "the colour mode found nothing" cannot look alike
+# from shore, which with both lidars down is the difference between a buoy leg that
+# is being steered and one that is running blind.
+CAPS = "still,artag,colour"
 
 # Deliberately the same values as receiver.py's COLOURS, keyed by detector class.
 # The bench viewer and the dashboard show the same scene, and a buoy that is green

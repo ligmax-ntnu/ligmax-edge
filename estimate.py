@@ -407,11 +407,24 @@ def bearing_sigma_deg(cam: Camera, uv_full, sigma_centroid_px):
 
 
 def estimate(cam: Camera, box_net, gray_full=None, clock: CaptureClock = None,
-             pts_ns=None, diameter_m=BUOY_DIAMETER_M):
+             pts_ns=None, diameter_m=BUOY_DIAMETER_M, pose=None):
     """Everything geometric for one detection. Box is in detector-input pixels.
 
     Keys are grouped so a consumer can ignore what it does not need, and every
     estimate carries its own sigma and validity rather than a bare number.
+
+    `pose` is this camera's mount (`fusion.Rig.cams[i]`), and passing it adds
+    `bearing_rig_deg` and `elevation_rig_deg` - **the only angles a consumer can
+    place an object with.** `bearing_deg` is measured from the OPTICAL AXIS, and
+    these lenses are yawed +-75 deg, so a mark dead ahead of camera 0 is 75 deg off
+    the port bow and not ahead of the boat. That distinction cost nothing while the
+    Pi used a detection only to refine a lidar track that already had a position;
+    with both lidars dead the camera creates the track, the bearing is the position,
+    and a 75 deg error puts every mark in the wrong water.
+
+    Omitted rather than guessed when there is no rig, because a wrong mount is worse
+    than an absent one - see `nodes/self_driving/perception/world._detection_position`
+    on the Pi, which says loudly what it is falling back to.
     """
     x1, y1, x2, y2 = [float(v) for v in box_net]
     full = cam.to_full([[x1, y1], [x2, y2]])
@@ -454,6 +467,20 @@ def estimate(cam: Camera, box_net, gray_full=None, clock: CaptureClock = None,
         out.update(bs)
     v = cam.rays([[ucx, ucy]])[0]
     out["ray_cam"] = None if not np.isfinite(v[0]) else [round(float(t), 6) for t in v]
+
+    # ---- the same ray in the RIG frame, which is the one the boat steers in.
+    #
+    # Rotation only: a ray has no position, so the mount's translation must not be
+    # applied here (the 5 cm baseline between a lens and the lidar origin is a
+    # parallax the range block would have to carry, and at these ranges it is far
+    # inside the bearing sigma). +x starboard, +y DOWN, +z forward in both frames,
+    # hence the negated y for an elevation that is positive up.
+    if pose is not None and np.isfinite(v[0]):
+        r = np.asarray(v, dtype=np.float64) @ np.asarray(pose.R, dtype=np.float64).T
+        out["bearing_rig_deg"] = round(math.degrees(math.atan2(r[0], r[2])), 4)
+        out["elevation_rig_deg"] = round(
+            math.degrees(-math.asin(max(-1.0, min(1.0, float(r[1]))))), 4
+        )
 
     # ---- range
     rng = range_from_angular_width(cam, xl, xr, yc, sigma_edge, diameter_m)

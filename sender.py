@@ -102,6 +102,7 @@ gi.require_version("GstVideo", "1.0")
 from gi.repository import GLib, Gst, GstApp, GstVideo  # noqa: E402,F401
 
 import artags
+import colour_marks
 import estimate
 import fusion
 import lidar as lidar_mod
@@ -402,6 +403,51 @@ def sample_to_bytes(sample):
     return data, buf.pts
 
 
+def merge_prompts(rows, conf, iou=0.5):
+    """The vessel engine's rows, deduplicated ACROSS its prompt classes.
+
+    The vessel model is YOLO-World with four phrases baked in - "boat", "small
+    unmanned surface vessel", "a small dark boat on grey water", "catamaran boat
+    on water" - and all four mean the same physical object. They are separate
+    classes because the four together find the Otter in frames none of them finds
+    alone: on the degraded test set each phrase reaches 26-37 % recall and the
+    four together reach 44 %, since they fail on different images
+    (`ligmax-ai/vessel/`).
+
+    The cost of that trick is duplicate boxes, and it is not something the engine
+    can fix for us: NMS inside the end-to-end head is CLASS-AWARE, so one Otter
+    answering to three phrases survives as three detections, three tracker ids and
+    three tracks in the Pi's world model - which would read as three vessels
+    converging and is exactly the input `colregs.py` must never be given.
+
+    So the classes are merged here, class-agnostically, highest score first. The
+    returned rows keep their winning score and are relabelled to a single class.
+    """
+    if rows is None or len(rows) == 0:
+        return np.empty((0, 6), dtype=np.float32)
+    keep = rows[rows[:, 4] >= conf]
+    if len(keep) == 0:
+        return keep
+    # Rows arrive score-sorted from the end-to-end head, so a linear sweep that
+    # keeps the first box of each cluster keeps the most confident one.
+    out = []
+    for row in keep:
+        x1, y1, x2, y2 = row[:4]
+        for chosen in out:
+            cx1, cy1, cx2, cy2 = chosen[:4]
+            ix = max(0.0, min(x2, cx2) - max(x1, cx1))
+            iy = max(0.0, min(y2, cy2) - max(y1, cy1))
+            inter = ix * iy
+            union = ((x2 - x1) * (y2 - y1) + (cx2 - cx1) * (cy2 - cy1) - inter)
+            if union > 0 and inter / union > iou:
+                break
+        else:
+            out.append(row)
+    merged = np.array(out, dtype=np.float32)
+    merged[:, 5] = protocol.VESSEL_CLASS_ID
+    return merged
+
+
 def classify_crop(rgb, box, engine, size=96):
     """Second stage: resize shortest edge to `size`, centre-crop, /255.
 
@@ -628,6 +674,31 @@ def main():
                          "stream on this board.")
     ap.add_argument("--engine", default="best_640x1280_b2_fp16.engine")
     ap.add_argument("--cls-engine", default="best-cls_fp16.engine")
+    ap.add_argument("--vessel-engine", default=None,
+                    help="TensorRT engine for the collision-avoidance detector "
+                         "(NJORD 9.2, the Otter). OFF unless given: it is a "
+                         "second forward pass over the same blob and costs frame "
+                         "time on every other task. Built from "
+                         "ligmax-ai/vessel/onnx/ -- see build_engine.sh there. Its "
+                         "input must match the buoy engine's exactly (2, 3, 640, "
+                         "1280); it is checked at startup rather than trusted. "
+                         "Emits class 3 `vessel`. Works with --no-detect, which "
+                         "is how the collision-avoidance leg should be flown.")
+    ap.add_argument("--vessel-conf", type=float, default=0.25,
+                    help="confidence floor for the vessel engine, kept separate "
+                         "from --conf on purpose: the two engines are different "
+                         "models with different score distributions, and one "
+                         "number for both means tuning the buoys detunes the "
+                         "Otter. Measured on ligmax-ai/vessel/synth: 0.25 is "
+                         "where recall is still high and false positives on open "
+                         "water are zero.")
+    ap.add_argument("--vessel-beam", type=float, default=protocol.OTTER_BEAM_M,
+                    help="assumed real width of a vessel, metres, for the "
+                         "range-from-apparent-width estimate. The Otter's BEAM "
+                         "(1.08 m) rather than its length (2.0 m), deliberately: "
+                         "the boat cannot know the Otter's aspect, and the narrow "
+                         "figure makes the range an under-estimate, so the "
+                         "give-way manoeuvre starts early rather than late.")
     ap.add_argument("--no-detect", action="store_true",
                     help="do not load the YOLO engine at all: capture, previews, "
                          "full-resolution stills, bearings and the lidar all run, "
@@ -697,6 +768,33 @@ def main():
                          "detectMarkers over about a third of each frame; runs "
                          "happily with --no-detect and --no-lidar, which is the "
                          "docking configuration.")
+    ap.add_argument("--colour-marks", action="store_true",
+                    help="find red and green marks from HUE, below the horizon, "
+                         "alongside (or instead of) the YOLO -- `colour_marks.py`. "
+                         "The surprise task's colour mode. With both lidars dead "
+                         "the vessel's world model has nothing posing questions for "
+                         "the cameras to answer, so a scored buoy leg runs blind "
+                         "unless something can create a mark; this is the same hue "
+                         "and saturation windows the vessel has always called a "
+                         "coloured lidar return red or green with, run on the frame "
+                         "instead. Detections carry `src: \"colour\"` and the "
+                         "vessel decides whether to trust them "
+                         "(`set_mark_source`). Costs one HSV pass and a "
+                         "connectedComponents per camera, ~6 ms at 480 px; needs "
+                         "cv2 and a calibration, both checked at start-up. Runs "
+                         "happily with --no-detect, which is the mode for a boat "
+                         "that trusts the hue and not the detector.")
+    ap.add_argument("--colour-cut", type=float, default=None,
+                    help="override the computed horizon with a FLAT cut, as a "
+                         "fraction of frame height from the top (0.45 is a "
+                         "reasonable start). Nothing above the cut is ever counted, "
+                         "which is what keeps signage, jackets and red roofs out of "
+                         "the marks. The default computes the cut per column from "
+                         "the lens model and rig.json's mount, which is right on a "
+                         "fisheye at +-75 deg where the horizon is a curve rather "
+                         "than a row -- use this when the mount pitch is wrong or "
+                         "unknown, or to reproduce what /surprise_task's slider is "
+                         "showing.")
     ap.add_argument("--artag-size", type=float, default=artags.TAG_M,
                     help="the tags' BLACK SQUARE edge in metres (default 0.18, per "
                          "the handbook). Every range scales linearly with this, so "
@@ -881,6 +979,27 @@ def main():
         except Exception as e:
             print(f"[warn] no cardinal classifier ({e}); continuing without it")
 
+    # ---- the vessel detector (NJORD 9.2), a SECOND engine over the same blob.
+    #
+    # Optional, and its absence is not an error: most of the course has no vessel
+    # in it, and a board whose engine has not been rebuilt should still run the
+    # buoys. It is loaded independently of `det` so it works with --no-detect too,
+    # which is how a collision-avoidance run is flown - the buoy detector is not
+    # wanted on that leg and costs frame time.
+    ves = None
+    if args.vessel_engine:
+        try:
+            ves = Engine(args.vessel_engine)
+            vb, _, vh, vw = ves.in_shape
+            if (vb, vh, vw) != (2, net_h, net_w):
+                print(f"vessel engine is {ves.in_shape}; it must match the blob "
+                      f"(2, 3, {net_h}, {net_w}). Re-export at that size.",
+                      file=sys.stderr)
+                return 2
+            print(f"vessel {args.vessel_engine}: in {ves.in_shape} out {ves.out_shape}")
+        except Exception as e:
+            print(f"[warn] no vessel engine ({e}); continuing without it")
+
     # Crop a net_w:net_h-shaped window so the scale is uniform and there is no
     # padding. Aspect must match the network exactly: a non-uniform scale would need
     # fx and fy scaled by different factors, and estimate.Camera refuses that rather
@@ -1006,6 +1125,31 @@ def main():
     # full-resolution branch the bearings do -- and they need it even under
     # --no-estimate, which is why this is its own flag and not folded into do_est.
     want_tags = finder is not None
+
+    # The colour test: red and green marks from hue alone, below the horizon.
+    # Constructed up front and loudly for the same reason the tags are -- every way
+    # it can fail is a start-up fact, and a boat that reaches the buoy legs having
+    # silently lost its only mark source drives them blind (`colour_marks.py`).
+    #
+    # One per camera because the horizon table is per camera: the two are yawed
+    # +-75 deg, so the curve that is "level water" sits in a different place in each
+    # frame, and sharing one table would put the cut on the wrong columns for both.
+    colour = [None, None]
+    if args.colour_marks:
+        for i in (0, 1):
+            if cams[i] is None:
+                print(f"[warn] colour marks OFF for cam{i}: no calibration, so "
+                      f"there is no horizon to cut at", file=sys.stderr)
+                continue
+            colour[i] = colour_marks.ColourMarks(
+                cams[i], rig.cams[i] if rig is not None else None,
+                net_w, net_h, cut_frac=args.colour_cut,
+            )
+            print(f"cam{i} {colour[i].describe()}")
+        if rig is None and args.colour_cut is None:
+            print("[warn] no rig geometry, so the horizon is the LENS axis and not "
+                  "the water -- pass --colour-cut, or the cut is wrong by the "
+                  "camera's mount pitch", file=sys.stderr)
 
     Gst.init(None)
     desc = build_pipeline(args, w, h, fps, crops, net_w, net_h, pw, ph)
@@ -1242,34 +1386,61 @@ def main():
             # stops is only the inference: capture, previews, stills, the lidar
             # and the frames on the wire all carry on, because tearing the
             # pipeline down to stop inferring is what latches Argus.
-            detecting = det is not None and (cloud is None or cloud.detect)
-            if detecting:
+            live = cloud is None or cloud.detect
+            detecting = det is not None and live
+            # The vessel engine rides the same switch, because it is inference and
+            # the dashboard's toggle means "stop inferring". It does NOT ride
+            # `det`: --no-detect is how a collision-avoidance leg is flown, with
+            # the buoy engine off so the frame budget goes to the one detector
+            # that leg is scored on.
+            hunting = ves is not None and live
+            if detecting or hunting:
                 for i in (0, 1):
                     # Fused multiply into a preallocated buffer: the obvious
                     # astype()/255 form measured 17 ms per camera here, this one
                     # 3.5 ms.
                     np.multiply(rgbs[i].transpose(2, 0, 1), np.float32(1.0 / 255.0),
                                 out=blob[i])
-                out = det.infer(blob)[0]        # (2, 300, 6)
-            else:
-                out = None
+            out = det.infer(blob)[0] if detecting else None   # (2, 300, 6)
+            vout = ves.infer(blob)[0] if hunting else None    # (2, 300, 6)
             now = time.time()
             frames += 1
 
             per_cam = []
             for i in (0, 1):
-                if out is None:
+                if out is None and vout is None and colour[i] is None:
                     # An empty list, not a missing key: a frame with the detector
                     # off is a frame with nothing detected in it, and every
                     # consumer already handles that. The alternative -- omitting
                     # `dets` -- would make receiver.py and cloud_camera's overlay
                     # each need a new case for a state that is not new.
+                    #
+                    # `colour[i]` is in the test because the colour finder needs no
+                    # engine: `--no-detect --colour-marks` is a real configuration -
+                    # a boat that trusts the hue and not the detector - and without
+                    # this it would return here and ship nothing.
                     per_cam.append([])
                     continue
-                rows = out[i]
-                keep = rows[rows[:, 4] >= args.conf]
-                ids = (trackers[i].update(keep[:, :4]) if trackers
-                       else [None] * len(keep))
+
+                if out is not None:
+                    rows = out[i]
+                    keep = rows[rows[:, 4] >= args.conf]
+                else:
+                    keep = np.empty((0, 6), dtype=np.float32)
+                vkeep = (merge_prompts(vout[i], args.vessel_conf)
+                         if vout is not None
+                         else np.empty((0, 6), dtype=np.float32))
+
+                # ONE tracker update per camera per frame, over both engines'
+                # boxes together. The IoU tracker carries state between calls, so
+                # updating it twice for one frame would have it match this frame's
+                # vessels against this frame's buoys and hand out fresh ids every
+                # tick. Concatenate, update once, then split the ids back out.
+                allboxes = np.concatenate([keep[:, :4], vkeep[:, :4]]) \
+                    if len(vkeep) else keep[:, :4]
+                ids = (trackers[i].update(allboxes) if trackers
+                       else [None] * len(allboxes))
+
                 items = []
                 # Rows arrive score-sorted from the end-to-end head, so taking the
                 # first N cardinals is the same as taking the most confident ones.
@@ -1280,6 +1451,11 @@ def main():
                         "id": ids[n],
                         "cls": c,
                         "name": protocol.CLASS_NAMES.get(c, str(c)),
+                        # Which instrument found this. Present on every detection
+                        # from every source, so `world._create_mark` on the vessel
+                        # can trust one and not the other rather than having to
+                        # infer it from the class or the confidence.
+                        "src": "yolo",
                         "conf": round(float(score), 4),
                         "box": [round(float(x1), 1), round(float(y1), 1),
                                 round(float(x2), 1), round(float(y2), 1)],
@@ -1299,11 +1475,100 @@ def main():
                             d.update(estimate.estimate(
                                 cams[i], (x1, y1, x2, y2), gray_full=ys[i],
                                 clock=clock, pts_ns=ptss[i],
-                                diameter_m=args.buoy_diameter))
+                                diameter_m=args.buoy_diameter,
+                                pose=rig.cams[i] if rig is not None else None))
                         except Exception as e:      # never let geometry kill a frame
                             est_err[0] += 1
                             d["estimate_error"] = str(e)[:120]
                     items.append(d)
+
+                # ---- the vessel engine's detections, same shape as any other.
+                for n, (x1, y1, x2, y2, score, _c) in enumerate(vkeep):
+                    d = {
+                        "id": ids[len(keep) + n],
+                        "cls": protocol.VESSEL_CLASS_ID,
+                        "name": protocol.CLASS_NAMES[protocol.VESSEL_CLASS_ID],
+                        # "yolo" as well: a separate engine, but the same kind of
+                        # instrument, and the vessel's vessel-creating exception is
+                        # gated on its own confidence bar rather than on this string.
+                        "src": "yolo",
+                        "conf": round(float(score), 4),
+                        "box": [round(float(x1), 1), round(float(y1), 1),
+                                round(float(x2), 1), round(float(y2), 1)],
+                        "card": None,
+                        "card_conf": None,
+                    }
+                    if cams[i] is not None:
+                        try:
+                            # `--vessel-beam`, not `--buoy-diameter`. The range is
+                            # apparent width against an assumed real width, and a
+                            # 2 m hull measured against a 0.40 m buoy would be
+                            # reported five times too close.
+                            #
+                            # `refine_extent` is NOT given a gray plane here: it
+                            # refines a silhouette by walking the intensity
+                            # profile out to a half-amplitude crossing, which is
+                            # right for a smooth 40 cm dome against water and
+                            # wrong for a hull with a mast, a radome and an
+                            # orange superstructure - it latches onto whichever
+                            # internal edge has the strongest contrast and
+                            # reports a fraction of the beam, i.e. a vessel much
+                            # further away than it is. The detector box is the
+                            # honest measurement for this object.
+                            d.update(estimate.estimate(
+                                cams[i], (x1, y1, x2, y2), gray_full=None,
+                                clock=clock, pts_ns=ptss[i],
+                                diameter_m=args.vessel_beam,
+                                pose=rig.cams[i] if rig is not None else None))
+                        except Exception as e:
+                            est_err[0] += 1
+                            d["estimate_error"] = str(e)[:120]
+                    items.append(d)
+
+                # ---- the colour test's marks, same shape again.
+                #
+                # `id` is None on purpose. The IoU tracker was updated once for this
+                # frame, over the two engines' boxes, and adding a third set to that
+                # update would have it match this frame's colour blobs against last
+                # frame's YOLO boxes and hand out fresh ids to everything. The
+                # protocol already documents a null id (it is what --no-track gives),
+                # and the vessel associates by position anyway - `world._nearest`,
+                # which is the association that actually decides what is one buoy.
+                if colour[i] is not None:
+                    for x1, y1, x2, y2, fill, c in colour[i].find(rgbs[i]):
+                        d = {
+                            "id": None,
+                            "cls": c,
+                            "name": protocol.CLASS_NAMES.get(c, str(c)),
+                            "src": colour_marks.SOURCE,
+                            # The blob's fill, not a detector score - see
+                            # `ColourMarks.find`. Named `conf` because every consumer
+                            # already reads that key and the vessel compares it
+                            # against a source-specific floor
+                            # (`MARK_MIN_CONF_COLOUR`), so the two numbers are never
+                            # weighed against each other.
+                            "conf": round(float(fill), 4),
+                            "box": [round(float(x1), 1), round(float(y1), 1),
+                                    round(float(x2), 1), round(float(y2), 1)],
+                            "card": None,
+                            "card_conf": None,
+                        }
+                        if cams[i] is not None:
+                            try:
+                                # `gray_full=ys[i]`, the same as a YOLO buoy box: a
+                                # mark IS a smooth 40 cm dome against water, which is
+                                # the one shape `refine_extent` is right for, and the
+                                # subpixel edges are worth several per cent of range.
+                                d.update(estimate.estimate(
+                                    cams[i], (x1, y1, x2, y2), gray_full=ys[i],
+                                    clock=clock, pts_ns=ptss[i],
+                                    diameter_m=args.buoy_diameter,
+                                    pose=rig.cams[i] if rig is not None else None))
+                            except Exception as e:
+                                est_err[0] += 1
+                                d["estimate_error"] = str(e)[:120]
+                        items.append(d)
+
                 per_cam.append(items)
 
             # ---- lidar fusion, between building the detections and sending them,
@@ -1497,6 +1762,8 @@ def main():
             det.close()
         if cls is not None:
             cls.close()
+        if ves is not None:
+            ves.close()
     return 0
 
 

@@ -18,6 +18,9 @@
 #                          all of which are already in /etc/ligmax/node.env.
 #                          NO_CLOUD=1 disables it.
 #
+# VESSEL=<engine> adds the collision-avoidance detector alongside (or instead of,
+# with --no-detect) the buoy one. See the block further down.
+#
 # PORT is 3401, not 3338: the dashboard binds 3338 and live.ligmax.no is forwarded
 # there, so this feed moved off it (docs/findings.md item 1).
 set -uo pipefail
@@ -79,7 +82,26 @@ if [ "${LIDAR:-1}" = "0" ]; then
   LIDAR_ARG=(--no-lidar)
 fi
 
+# The collision-avoidance detector (NJORD 9.2, the Otter). OFF unless VESSEL is
+# set, because it is a second forward pass over the same blob and every other
+# task pays for it in frame time.
+#
+#   VESSEL=vessel_640x1280_b2_fp16.engine ./run.sh          buoys AND the Otter
+#   VESSEL=... ./run.sh --no-detect                         the Otter only
+#
+# The second form is the one to fly Task 2 with: that leg is scored on the vessel
+# and the buoy engine is just spending milliseconds.
+VESSEL_ARG=()
+if [ -n "${VESSEL:-}" ]; then
+  if [ ! -f "$VESSEL" ]; then
+    echo "VESSEL=$VESSEL does not exist." >&2
+    echo "  Build it on THIS board: sh build_engine.sh (from ligmax-ai/vessel/onnx/)." >&2
+    exit 1
+  fi
+  VESSEL_ARG=(--vessel-engine "$VESSEL")
+fi
+
 echo
 exec ./.venv/bin/python sender.py \
   --host "$HOST" --port "$PORT" --mode "$MODE" --preview "$PREVIEW" \
-  "${CLOUD_ARG[@]}" "${LIDAR_ARG[@]}" "$@"
+  "${CLOUD_ARG[@]}" "${LIDAR_ARG[@]}" "${VESSEL_ARG[@]}" "$@"
